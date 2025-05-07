@@ -1,224 +1,84 @@
-# SAM 2: Segment Anything in Images and Videos
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/sam2-unet-segment-anything-2-makes-strong/salient-object-detection-on-duts-te-1)](https://paperswithcode.com/sota/salient-object-detection-on-duts-te-1?p=sam2-unet-segment-anything-2-makes-strong)
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/sam2-unet-segment-anything-2-makes-strong/salient-object-detection-on-dut-omron-2)](https://paperswithcode.com/sota/salient-object-detection-on-dut-omron-2?p=sam2-unet-segment-anything-2-makes-strong)
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/sam2-unet-segment-anything-2-makes-strong/salient-object-detection-on-hku-is-1)](https://paperswithcode.com/sota/salient-object-detection-on-hku-is-1?p=sam2-unet-segment-anything-2-makes-strong)
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/sam2-unet-segment-anything-2-makes-strong/salient-object-detection-on-pascal-s-1)](https://paperswithcode.com/sota/salient-object-detection-on-pascal-s-1?p=sam2-unet-segment-anything-2-makes-strong)
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/sam2-unet-segment-anything-2-makes-strong/salient-object-detection-on-ecssd-1)](https://paperswithcode.com/sota/salient-object-detection-on-ecssd-1?p=sam2-unet-segment-anything-2-makes-strong)
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/sam2-unet-segment-anything-2-makes-strong/image-segmentation-on-mas3k)](https://paperswithcode.com/sota/image-segmentation-on-mas3k?p=sam2-unet-segment-anything-2-makes-strong)
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/sam2-unet-segment-anything-2-makes-strong/image-segmentation-on-rmas)](https://paperswithcode.com/sota/image-segmentation-on-rmas?p=sam2-unet-segment-anything-2-makes-strong)
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/sam2-unet-segment-anything-2-makes-strong/image-segmentation-on-msd-mirror-segmentation)](https://paperswithcode.com/sota/image-segmentation-on-msd-mirror-segmentation?p=sam2-unet-segment-anything-2-makes-strong)
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/sam2-unet-segment-anything-2-makes-strong/image-segmentation-on-pmd)](https://paperswithcode.com/sota/image-segmentation-on-pmd?p=sam2-unet-segment-anything-2-makes-strong)
 
-**[AI at Meta, FAIR](https://ai.meta.com/research/)**
+## [SAM2-UNet: Segment Anything 2 Makes Strong Encoder for Natural and Medical Image Segmentation](https://arxiv.org/abs/2408.08870)
+Xinyu Xiong, Zihuang Wu, Shuangyi Tan, Wenxue Li, Feilong Tang, Ying Chen, Siying Li, Jie Ma, Guanbin Li
 
-[Nikhila Ravi](https://nikhilaravi.com/), [Valentin Gabeur](https://gabeur.github.io/), [Yuan-Ting Hu](https://scholar.google.com/citations?user=E8DVVYQAAAAJ&hl=en), [Ronghang Hu](https://ronghanghu.com/), [Chaitanya Ryali](https://scholar.google.com/citations?user=4LWx24UAAAAJ&hl=en), [Tengyu Ma](https://scholar.google.com/citations?user=VeTSl0wAAAAJ&hl=en), [Haitham Khedr](https://hkhedr.com/), [Roman Rädle](https://scholar.google.de/citations?user=Tpt57v0AAAAJ&hl=en), [Chloe Rolland](https://scholar.google.com/citations?hl=fr&user=n-SnMhoAAAAJ), [Laura Gustafson](https://scholar.google.com/citations?user=c8IpF9gAAAAJ&hl=en), [Eric Mintun](https://ericmintun.github.io/), [Junting Pan](https://junting.github.io/), [Kalyan Vasudev Alwala](https://scholar.google.co.in/citations?user=m34oaWEAAAAJ&hl=en), [Nicolas Carion](https://www.nicolascarion.com/), [Chao-Yuan Wu](https://chaoyuan.org/), [Ross Girshick](https://www.rossgirshick.info/), [Piotr Dollár](https://pdollar.github.io/), [Christoph Feichtenhofer](https://feichtenhofer.github.io/)
+## Introduction
+![framework](./sam2unet.jpg)Image segmentation plays an important role in vision understanding. Recently, the emerging vision foundation models continuously achieved superior performance on various tasks. Following such success, in this paper, we prove that the Segment Anything Model 2 (SAM2) can be a strong encoder for U-shaped segmentation models. We propose a simple but effective framework, termed SAM2-UNet, for versatile image segmentation. Specifically, SAM2-UNet adopts the Hiera backbone of SAM2 as the encoder, while the decoder uses the classic U-shaped design. Additionally, adapters are inserted into the encoder to allow parameter-efficient fine-tuning. Preliminary experiments on various downstream tasks, such as camouflaged object detection, salient object detection, marine animal segmentation, mirror detection, and polyp segmentation, demonstrate that our SAM2-UNet can simply beat existing specialized state-of-the-art methods without bells and whistles.
 
-[[`Paper`](https://ai.meta.com/research/publications/sam-2-segment-anything-in-images-and-videos/)] [[`Project`](https://ai.meta.com/sam2)] [[`Demo`](https://sam2.metademolab.com/)] [[`Dataset`](https://ai.meta.com/datasets/segment-anything-video)] [[`Blog`](https://ai.meta.com/blog/segment-anything-2)] [[`BibTeX`](#citing-sam-2)]
+[微信交流群](./wechat0423.jpg)
 
-![SAM 2 architecture](assets/model_diagram.png?raw=true)
-
-**Segment Anything Model 2 (SAM 2)** is a foundation model towards solving promptable visual segmentation in images and videos. We extend SAM to video by considering images as a video with a single frame. The model design is a simple transformer architecture with streaming memory for real-time video processing. We build a model-in-the-loop data engine, which improves model and data via user interaction, to collect [**our SA-V dataset**](https://ai.meta.com/datasets/segment-anything-video), the largest video segmentation dataset to date. SAM 2 trained on our data provides strong performance across a wide range of tasks and visual domains.
-
-![SA-V dataset](assets/sa_v_dataset.jpg?raw=true)
-
-## Latest updates
-
-**12/11/2024 -- full model compilation for a major VOS speedup and a new `SAM2VideoPredictor` to better handle multi-object tracking**
-
-- We now support `torch.compile` of the entire SAM 2 model on videos, which can be turned on by setting `vos_optimized=True` in `build_sam2_video_predictor`, leading to a major speedup for VOS inference.
-- We update the implementation of `SAM2VideoPredictor` to support independent per-object inference, allowing us to relax the assumption of prompting for multi-object tracking and adding new objects after tracking starts.
-- See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for full details.
-
-**09/30/2024 -- SAM 2.1 Developer Suite (new checkpoints, training code, web demo) is released**
-
-- A new suite of improved model checkpoints (denoted as **SAM 2.1**) are released. See [Model Description](#model-description) for details.
-  * To use the new SAM 2.1 checkpoints, you need the latest model code from this repo. If you have installed an earlier version of this repo, please first uninstall the previous version via `pip uninstall SAM-2`, pull the latest code from this repo (with `git pull`), and then reinstall the repo following [Installation](#installation) below.
-- The training (and fine-tuning) code has been released. See [`training/README.md`](training/README.md) on how to get started.
-- The frontend + backend code for the SAM 2 web demo has been released. See [`demo/README.md`](demo/README.md) for details.
-
-## Installation
-
-SAM 2 needs to be installed first before use. The code requires `python>=3.10`, as well as `torch>=2.5.1` and `torchvision>=0.20.1`. Please follow the instructions [here](https://pytorch.org/get-started/locally/) to install both PyTorch and TorchVision dependencies. You can install SAM 2 on a GPU machine using:
-
-```bash
-git clone https://github.com/facebookresearch/sam2.git && cd sam2
-
-pip install -e .
-```
-If you are installing on Windows, it's strongly recommended to use [Windows Subsystem for Linux (WSL)](https://learn.microsoft.com/en-us/windows/wsl/install) with Ubuntu.
-
-To use the SAM 2 predictor and run the example notebooks, `jupyter` and `matplotlib` are required and can be installed by:
-
-```bash
-pip install -e ".[notebooks]"
+## Clone Repository
+```shell
+git clone https://github.com/WZH0120/SAM2-UNet.git
+cd SAM2-UNet/
 ```
 
-Note:
-1. It's recommended to create a new Python environment via [Anaconda](https://www.anaconda.com/) for this installation and install PyTorch 2.5.1 (or higher) via `pip` following https://pytorch.org/. If you have a PyTorch version lower than 2.5.1 in your current environment, the installation command above will try to upgrade it to the latest PyTorch version using `pip`.
-2. The step above requires compiling a custom CUDA kernel with the `nvcc` compiler. If it isn't already available on your machine, please install the [CUDA toolkits](https://developer.nvidia.com/cuda-toolkit-archive) with a version that matches your PyTorch CUDA version.
-3. If you see a message like `Failed to build the SAM 2 CUDA extension` during installation, you can ignore it and still use SAM 2 (some post-processing functionality may be limited, but it doesn't affect the results in most cases).
+## Prepare Datasets
+You can refer to the following repositories and their papers for the detailed configurations of the corresponding datasets.
+- Camouflaged Object Detection. Please refer to [FEDER](https://github.com/ChunmingHe/FEDER). [#issue [#13](https://github.com/WZH0120/SAM2-UNet/issues/13), [#44](https://github.com/WZH0120/SAM2-UNet/issues/44)]
+- Salient Object Detection. Please refer to [SALOD](https://github.com/moothes/SALOD).
+- Marine Animal Segmentation. Please refer to [MASNet](https://github.com/zhenqifu/MASNet).
+- Mirror Detection. Please refer to [HetNet](https://github.com/Catherine-R-He/HetNet).
+- Polyp Segmentation. Please refer to [PraNet](https://github.com/DengPingFan/PraNet).
 
-Please see [`INSTALL.md`](./INSTALL.md) for FAQs on potential issues and solutions.
+## Requirements
+Our project does not depend on installing SAM2. If you have already configured an environment for SAM2, then directly using this environment should also be fine. You may also create a new conda environment:
 
-## Getting Started
-
-### Download Checkpoints
-
-First, we need to download a model checkpoint. All the model checkpoints can be downloaded by running:
-
-```bash
-cd checkpoints && \
-./download_ckpts.sh && \
-cd ..
+```shell
+conda create -n sam2-unet python=3.10
+conda activate sam2-unet
+pip install -r requirements.txt
 ```
 
-or individually from:
+## Training
+If you want to train your own model, please download the pre-trained segment anything 2 (not SAM2.1, [#issue [#18](https://github.com/WZH0120/SAM2-UNet/issues/18), [#30](https://github.com/WZH0120/SAM2-UNet/issues/30)]) from the [official repository](https://github.com/facebookresearch/segment-anything-2). You can also directly download `sam2_hiera_large.pt` from [here](https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt). After the above preparations, you can run `train.sh` to start your training.
 
-- [sam2.1_hiera_tiny.pt](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt)
-- [sam2.1_hiera_small.pt](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt)
-- [sam2.1_hiera_base_plus.pt](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt)
-- [sam2.1_hiera_large.pt](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt)
+## Testing
+Our pre-trained models and prediction maps can be found on [Google Drive](https://drive.google.com/drive/folders/1w2fK8kLhtEmMWZ6G6w9_J17xwgfm3lev?usp=drive_link). Also, you can run `test.sh` to obtain your own predictions.
 
-(note that these are the improved checkpoints denoted as SAM 2.1; see [Model Description](#model-description) for details.)
+## Evaluation
+After obtaining the prediction maps, you can run `eval.sh` to get most of the quantitative results. For the evaluation of mirror detection, please refer to `eval.py` in [HetNet](https://github.com/Catherine-R-He/HetNet) to obtain the results.
 
-Then SAM 2 can be used in a few lines as follows for image and video prediction.
+## Other Interesting Works
+If you are interested in designing SAM2-based methods, the following papers may be helpful:
 
-### Image prediction
+[2025.03] [Adapting Vision Foundation Models for Real-time Ultrasound Image Segmentation](https://arxiv.org/abs/2503.24368)
 
-SAM 2 has all the capabilities of [SAM](https://github.com/facebookresearch/segment-anything) on static images, and we provide image prediction APIs that closely resemble SAM for image use cases. The `SAM2ImagePredictor` class has an easy interface for image prompting.
+[2025.03] [DSU-Net:An Improved U-Net Model Based on DINOv2 and SAM2 with Multi-scale Cross-model Feature Enhancement](https://arxiv.org/abs/2503.21187)
 
-```python
-import torch
-from sam2.build_sam import build_sam2
-from sam2.sam2_image_predictor import SAM2ImagePredictor
+[2025.03] [Research on recognition of diabetic retinopathy hemorrhage lesions based on fine tuning of segment anything model](https://www.nature.com/articles/s41598-025-92665-7)
 
-checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
-model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-predictor = SAM2ImagePredictor(build_sam2(model_cfg, checkpoint))
+[2025.03] [SAM2-ELNet: Label Enhancement and Automatic Annotation for Remote Sensing Segmentation](https://arxiv.org/abs/2503.12404)
 
-with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-    predictor.set_image(<your_image>)
-    masks, _, _ = predictor.predict(<input_prompts>)
+[2025.02] [Fine-Tuning SAM2 for Generalizable Polyp Segmentation with a Channel Attention-Enhanced Decoder](https://ojs.sgsci.org/journals/amr/article/view/311)
+
+[2025.02] [FE-UNet: Frequency Domain Enhanced U-Net with Segment Anything Capability for Versatile Image Segmentation](https://arxiv.org/abs/2502.03829)
+
+[2025.01] [Progressive Self-Prompting Segment Anything Model for Salient Object Detection in Optical Remote Sensing Images](https://doi.org/10.3390/rs17020342)
+
+[2024.12] [Adapting SAM2 Model from Natural Images for Tooth Segmentation in Dental Panoramic X-Ray Images](https://doi.org/10.3390/e26121059)
+
+[2024.11] [SAM-I2I: Unleash the Power of Segment Anything Model for Medical Image Translation](https://arxiv.org/abs/2411.12755)
+
+## Citation and Star
+Please cite the following paper and star this project if you use this repository in your research. Thank you!
 ```
-
-Please refer to the examples in [image_predictor_example.ipynb](./notebooks/image_predictor_example.ipynb) (also in Colab [here](https://colab.research.google.com/github/facebookresearch/sam2/blob/main/notebooks/image_predictor_example.ipynb)) for static image use cases.
-
-SAM 2 also supports automatic mask generation on images just like SAM. Please see [automatic_mask_generator_example.ipynb](./notebooks/automatic_mask_generator_example.ipynb) (also in Colab [here](https://colab.research.google.com/github/facebookresearch/sam2/blob/main/notebooks/automatic_mask_generator_example.ipynb)) for automatic mask generation in images.
-
-### Video prediction
-
-For promptable segmentation and tracking in videos, we provide a video predictor with APIs for example to add prompts and propagate masklets throughout a video. SAM 2 supports video inference on multiple objects and uses an inference state to keep track of the interactions in each video.
-
-```python
-import torch
-from sam2.build_sam import build_sam2_video_predictor
-
-checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
-model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-predictor = build_sam2_video_predictor(model_cfg, checkpoint)
-
-with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-    state = predictor.init_state(<your_video>)
-
-    # add new prompts and instantly get the output on the same frame
-    frame_idx, object_ids, masks = predictor.add_new_points_or_box(state, <your_prompts>):
-
-    # propagate the prompts to get masklets throughout the video
-    for frame_idx, object_ids, masks in predictor.propagate_in_video(state):
-        ...
-```
-
-Please refer to the examples in [video_predictor_example.ipynb](./notebooks/video_predictor_example.ipynb) (also in Colab [here](https://colab.research.google.com/github/facebookresearch/sam2/blob/main/notebooks/video_predictor_example.ipynb)) for details on how to add click or box prompts, make refinements, and track multiple objects in videos.
-
-## Load from 🤗 Hugging Face
-
-Alternatively, models can also be loaded from [Hugging Face](https://huggingface.co/models?search=facebook/sam2) (requires `pip install huggingface_hub`).
-
-For image prediction:
-
-```python
-import torch
-from sam2.sam2_image_predictor import SAM2ImagePredictor
-
-predictor = SAM2ImagePredictor.from_pretrained("facebook/sam2-hiera-large")
-
-with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-    predictor.set_image(<your_image>)
-    masks, _, _ = predictor.predict(<input_prompts>)
-```
-
-For video prediction:
-
-```python
-import torch
-from sam2.sam2_video_predictor import SAM2VideoPredictor
-
-predictor = SAM2VideoPredictor.from_pretrained("facebook/sam2-hiera-large")
-
-with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-    state = predictor.init_state(<your_video>)
-
-    # add new prompts and instantly get the output on the same frame
-    frame_idx, object_ids, masks = predictor.add_new_points_or_box(state, <your_prompts>):
-
-    # propagate the prompts to get masklets throughout the video
-    for frame_idx, object_ids, masks in predictor.propagate_in_video(state):
-        ...
-```
-
-## Model Description
-
-### SAM 2.1 checkpoints
-
-The table below shows the improved SAM 2.1 checkpoints released on September 29, 2024.
-|      **Model**       | **Size (M)** |    **Speed (FPS)**     | **SA-V test (J&F)** | **MOSE val (J&F)** | **LVOS v2 (J&F)** |
-| :------------------: | :----------: | :--------------------: | :-----------------: | :----------------: | :---------------: |
-|   sam2.1_hiera_tiny <br /> ([config](sam2/configs/sam2.1/sam2.1_hiera_t.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt))    |     38.9     |          91.2          |        76.5         |        71.8        |       77.3        |
-|   sam2.1_hiera_small <br /> ([config](sam2/configs/sam2.1/sam2.1_hiera_s.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt))   |      46      |          84.8          |        76.6         |        73.5        |       78.3        |
-| sam2.1_hiera_base_plus <br /> ([config](sam2/configs/sam2.1/sam2.1_hiera_b+.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt)) |     80.8     |        64.1          |        78.2         |        73.7        |       78.2        |
-|   sam2.1_hiera_large <br /> ([config](sam2/configs/sam2.1/sam2.1_hiera_l.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt))   |    224.4     |          39.5          |        79.5         |        74.6        |       80.6        |
-
-### SAM 2 checkpoints
-
-The previous SAM 2 checkpoints released on July 29, 2024 can be found as follows:
-
-|      **Model**       | **Size (M)** |    **Speed (FPS)**     | **SA-V test (J&F)** | **MOSE val (J&F)** | **LVOS v2 (J&F)** |
-| :------------------: | :----------: | :--------------------: | :-----------------: | :----------------: | :---------------: |
-|   sam2_hiera_tiny <br /> ([config](sam2/configs/sam2/sam2_hiera_t.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_tiny.pt))   |     38.9     |          91.5          |        75.0         |        70.9        |       75.3        |
-|   sam2_hiera_small <br /> ([config](sam2/configs/sam2/sam2_hiera_s.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_small.pt))   |      46      |          85.6          |        74.9         |        71.5        |       76.4        |
-| sam2_hiera_base_plus <br /> ([config](sam2/configs/sam2/sam2_hiera_b+.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_base_plus.pt)) |     80.8     |     64.8    |        74.7         |        72.8        |       75.8        |
-|   sam2_hiera_large <br /> ([config](sam2/configs/sam2/sam2_hiera_l.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt))   |    224.4     | 39.7 |        76.0         |        74.6        |       79.8        |
-
-Speed measured on an A100 with `torch 2.5.1, cuda 12.4`. See `benchmark.py` for an example on benchmarking (compiling all the model components). Compiling only the image encoder can be more flexible and also provide (a smaller) speed-up (set `compile_image_encoder: True` in the config).
-## Segment Anything Video Dataset
-
-See [sav_dataset/README.md](sav_dataset/README.md) for details.
-
-## Training SAM 2
-
-You can train or fine-tune SAM 2 on custom datasets of images, videos, or both. Please check the training [README](training/README.md) on how to get started.
-
-## Web demo for SAM 2
-
-We have released the frontend + backend code for the SAM 2 web demo (a locally deployable version similar to https://sam2.metademolab.com/demo). Please see the web demo [README](demo/README.md) for details.
-
-## License
-
-The SAM 2 model checkpoints, SAM 2 demo code (front-end and back-end), and SAM 2 training code are licensed under [Apache 2.0](./LICENSE), however the [Inter Font](https://github.com/rsms/inter?tab=OFL-1.1-1-ov-file) and [Noto Color Emoji](https://github.com/googlefonts/noto-emoji) used in the SAM 2 demo code are made available under the [SIL Open Font License, version 1.1](https://openfontlicense.org/open-font-license-official-text/).
-
-## Contributing
-
-See [contributing](CONTRIBUTING.md) and the [code of conduct](CODE_OF_CONDUCT.md).
-
-## Contributors
-
-The SAM 2 project was made possible with the help of many contributors (alphabetical):
-
-Karen Bergan, Daniel Bolya, Alex Bosenberg, Kai Brown, Vispi Cassod, Christopher Chedeau, Ida Cheng, Luc Dahlin, Shoubhik Debnath, Rene Martinez Doehner, Grant Gardner, Sahir Gomez, Rishi Godugu, Baishan Guo, Caleb Ho, Andrew Huang, Somya Jain, Bob Kamma, Amanda Kallet, Jake Kinney, Alexander Kirillov, Shiva Koduvayur, Devansh Kukreja, Robert Kuo, Aohan Lin, Parth Malani, Jitendra Malik, Mallika Malhotra, Miguel Martin, Alexander Miller, Sasha Mitts, William Ngan, George Orlin, Joelle Pineau, Kate Saenko, Rodrick Shepard, Azita Shokrpour, David Soofian, Jonathan Torres, Jenny Truong, Sagar Vaze, Meng Wang, Claudette Ward, Pengchuan Zhang.
-
-Third-party code: we use a GPU-based connected component algorithm adapted from [`cc_torch`](https://github.com/zsef123/Connected_components_PyTorch) (with its license in [`LICENSE_cctorch`](./LICENSE_cctorch)) as an optional post-processing step for the mask predictions.
-
-## Citing SAM 2
-
-If you use SAM 2 or the SA-V dataset in your research, please use the following BibTeX entry.
-
-```bibtex
-@article{ravi2024sam2,
-  title={SAM 2: Segment Anything in Images and Videos},
-  author={Ravi, Nikhila and Gabeur, Valentin and Hu, Yuan-Ting and Hu, Ronghang and Ryali, Chaitanya and Ma, Tengyu and Khedr, Haitham and R{\"a}dle, Roman and Rolland, Chloe and Gustafson, Laura and Mintun, Eric and Pan, Junting and Alwala, Kalyan Vasudev and Carion, Nicolas and Wu, Chao-Yuan and Girshick, Ross and Doll{\'a}r, Piotr and Feichtenhofer, Christoph},
-  journal={arXiv preprint arXiv:2408.00714},
-  url={https://arxiv.org/abs/2408.00714},
+@article{xiong2024sam2,
+  title={SAM2-UNet: Segment Anything 2 Makes Strong Encoder for Natural and Medical Image Segmentation},
+  author={Xiong, Xinyu and Wu, Zihuang and Tan, Shuangyi and Li, Wenxue and Tang, Feilong and Chen, Ying and Li, Siying and Ma, Jie and Li, Guanbin},
+  journal={arXiv preprint arXiv:2408.08870},
   year={2024}
 }
 ```
+
+## Acknowledgement
+[segment anything 2](https://github.com/facebookresearch/segment-anything-2)

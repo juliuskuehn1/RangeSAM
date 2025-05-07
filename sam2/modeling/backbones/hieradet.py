@@ -281,20 +281,23 @@ class Hiera(nn.Module):
         return pos_embed
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        print("Original shape of x: ", x.shape)
         x = self.patch_embed(x)
         # x: (B, H, W, C)
-
+        print("Shape of x after patch embed: ", x.shape)
         # Add pos embed
         x = x + self._get_pos_embed(x.shape[1:3])
-
+        print("Shape of x after pos embed: ", x.shape)
         outputs = []
         for i, blk in enumerate(self.blocks):
             x = blk(x)
+            print("Shape of x after block ", i, ": ", x.shape)
             if (i == self.stage_ends[-1]) or (
                 i in self.stage_ends and self.return_interm_layers
             ):
                 feats = x.permute(0, 3, 1, 2)
                 outputs.append(feats)
+                print("Shape of feats after block ", i, ": ", feats.shape)
 
         return outputs
 
