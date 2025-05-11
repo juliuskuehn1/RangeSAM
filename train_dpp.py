@@ -160,7 +160,7 @@ def boundary_loss(logits, mask, num_classes, ignore_index=0):
 # 4) Combined loss
 # -----------------------------------------------------------------------------
 def combined_loss(logits, mask, num_classes=20,
-                  w_ce=0.25, w_dice=0.25, w_lovasz=0.4, w_boundary=0.1):
+                  w_ce=0.25, w_dice=0.25, w_lovasz=1, w_boundary=0.5):
     """
     A mix of four losses:
       - standard cross-entropy
@@ -332,13 +332,41 @@ def train(rank, args):
     seed_torch(1904 + rank)
     train_loader, val_loader, train_sampler, val_sampler = initiate_parser(rank, args.world_size, args.batch_size)
     device = torch.device(f"cuda:{rank}")
-    model = SAM2UNet("sam2.1_hiera_t.yaml","sam2.1_hiera_tiny.pt", args.stem, args.freeze_weight, args.adapter, args.msca).to(device)
+    model = SAM2UNet(
+        "sam2.1_hiera_t.yaml",
+        "sam2.1_hiera_tiny.pt",
+        stem=args.stem,
+        freeze_weight=args.freeze_weight,
+        adapter=args.adapter,
+        msca=args.msca,
+        unify_dim=args.unify_dim,   # e.g. 256
+        use_rfb=args.use_rfb        # True / False
+    ).to(device)
     model = torch.nn.parallel.DistributedDataParallel(
         model,
-        device_ids=[rank],
-        find_unused_parameters=True    
+        device_ids=[rank]
     )
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    backbone_params = []
+    other_params    = []
+
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue                      # frozen → skip completely
+        if "encoder.backbone" in n:       # <- matches the SAM2 trunk you kept
+            backbone_params.append(p)     #    (adapt the string if you renamed)
+        else:
+            other_params.append(p)
+
+    assert backbone_params, "didn't catch any backbone parameters — check the name!"
+    assert other_params,    "everything landed in the backbone group?"
+
+    optimizer = optim.AdamW(
+    [
+        {"params": other_params,    "lr": 1e-3},   # heads, adapters, decoder
+        {"params": backbone_params, "lr": 1e-4},   # fine‑tune SAM2 trunk
+    ],
+    weight_decay=args.weight_decay,
+)
     os.makedirs(args.save_path, exist_ok=True)
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -393,6 +421,7 @@ if __name__ == "__main__":
                         help="training epochs")
     parser.add_argument("--lr", type=float, default=0.001, help="learning rate")
     parser.add_argument("--batch_size", default=4, type=int)
+    parser.add_argument("--use_rfb", default=True, type=bool)
     parser.add_argument("--weight_decay", default=5e-4, type=float)
     parser.add_argument("--world_size", type=int, default=torch.cuda.device_count(),
                         help="number of GPUs for DDP")

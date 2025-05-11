@@ -8,3 +8,4 @@ imageio
 pysodmetrics
 open3d
 scikit-learn
+cityscapesScripts

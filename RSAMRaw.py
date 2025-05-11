@@ -7,7 +7,7 @@ from utils.RSAMUtils import *
 class RSAMEncoder(nn.Module):
     def __init__(self,model_cfg, checkpoint_path=None, stem="rangeformer", freeze_weight=True, adapter=True, msca=True) -> None:
         super(RSAMEncoder, self).__init__()
-        self.backbone = build_backbone(model_cfg, checkpoint_path)
+        self.backbone = build_backbone(model_cfg)
         self.stem = self.backbone.patch_embed.proj
         out_channels = self.backbone.patch_embed.proj.out_channels
         del self.backbone.patch_embed.proj
@@ -80,9 +80,9 @@ class RSAMEncoder(nn.Module):
                 nn.Conv2d(6, 3, 1),
                 self.stem
             )
-        if freeze_weight:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
+        # if freeze_weight:
+        #     for param in self.backbone.parameters():
+        #         param.requires_grad = False
         msca_blocks = []
         for dim in [out_channels, out_channels*2, out_channels*4, out_channels*8]:
             if self.msca:
