@@ -160,7 +160,7 @@ def boundary_loss(logits, mask, num_classes, ignore_index=0):
 # 4) Combined loss
 # -----------------------------------------------------------------------------
 def combined_loss(logits, mask, num_classes=20,
-                  w_ce=0.25, w_dice=0.25, w_lovasz=1, w_boundary=0.5):
+                  w_ce=0.5, w_dice=0.5, w_lovasz=1.5, w_boundary=1):
     """
     A mix of four losses:
       - standard cross-entropy
@@ -194,6 +194,7 @@ def combined_loss(logits, mask, num_classes=20,
     median = freqs[1:].median()    
     w_c    = median / (freqs + eps)      # up‐weight rare classes
     w_c[0] = 0.0                         # ignore void
+    w_c = w_c * (len(w_c) / w_c.sum())
     # 1) CE (ignore void)
     ce = F.cross_entropy(logits, mask,
                          ignore_index=0, reduction='mean', weight=w_c)

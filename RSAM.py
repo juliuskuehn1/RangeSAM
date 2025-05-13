@@ -30,18 +30,18 @@ class RSAMEncoder(nn.Module):
             self.stem = new_conv
         elif self.stem_config == "rangeformer":
             self.stem = nn.Sequential(
-                nn.Conv2d(6, 12, kernel_size=1),
-                nn.BatchNorm2d(12),
+                nn.Conv2d( 5, 12, kernel_size=1),
+                nn.GroupNorm(1, 12),
                 nn.GELU(),
                 nn.Conv2d(12, 24, kernel_size=1),
-                nn.BatchNorm2d(24),
+                nn.GroupNorm(1, 24),
                 nn.GELU(),
                 nn.Conv2d(24, 48, kernel_size=1),
-                nn.BatchNorm2d(48),
+                nn.GroupNorm(1, 48),
                 nn.GELU(),
                 nn.Conv2d(48, 96, kernel_size=1),
-                nn.BatchNorm2d(96),
-                nn.GELU()
+                nn.GroupNorm(1, 96),
+                nn.GELU(),
             )
         elif self.stem_config == "normal":
             self.stem = nn.Sequential(
@@ -164,6 +164,52 @@ class RSAMDecoder(nn.Module):
         return pred_main, pred_aux  
     
 
+class RSAMUNETDecoder(nn.Module):
+    def __init__(self, out_channels, unify_dim=256) -> None:
+        super(RSAMUNETDecoder, self).__init__()
+        self.rfb1 = RFB_modified(out_channels, unify_dim)
+        self.rfb2 = RFB_modified(out_channels*2, unify_dim)
+        self.rfb3 = RFB_modified(out_channels*4, unify_dim)
+        self.rfb4 = RFB_modified(out_channels*8, unify_dim)
+        self.up1 = (Up(128, 64))
+        self.up2 = (Up(128, 64))
+        self.up3 = (Up(128, 64))
+        self.up4 = (Up(128, 64))
+        self.side1 = nn.Conv2d(unify_dim, 20, kernel_size=1)
+        self.side2 = nn.Conv2d(unify_dim, 20, kernel_size=1)
+        self.head = nn.Conv2d(unify_dim, 20, kernel_size=1)
+        
+        # self.conv1 = nn.Conv2d(out_channels, unify_dim, kernel_size=1)
+        # self.conv2 = nn.Conv2d(out_channels*2, unify_dim, kernel_size=1)
+        # self.conv3 = nn.Conv2d(out_channels*4, unify_dim, kernel_size=1)
+        # self.conv4 = nn.Conv2d(out_channels*8, unify_dim, kernel_size=1)
+        # self.main_head = nn.Sequential(
+        #     nn.Conv2d(unify_dim * 4, unify_dim * 3, 1),
+        #     nn.GELU(),
+        #     nn.Conv2d(unify_dim * 3, unify_dim * 2, 1),
+        #     nn.GELU(),
+        #     nn.Conv2d(unify_dim * 2, unify_dim * 1, 1),
+        #     nn.GELU(),
+        #     nn.Conv2d(unify_dim * 1, 20, 1),
+        #     nn.GELU(),
+        # )
+        # self.aux_heads = nn.ModuleList([
+        #     nn.Conv2d(unify_dim, 20, 1) for _ in range(4)
+        # ])
+        
+    def forward(self, x):
+        x1, x2, x3, x4 = x
+        x1, x2, x3, x4 = self.rfb1(x1), self.rfb2(x2), self.rfb3(x3), self.rfb4(x4)
+        # x1, x2, x3, x4 = self.conv1(x1), self.conv2(x2), self.conv3(x3),self.conv4(x4)
+        x = self.up1(x4, x3)
+        out1 = F.interpolate(self.side1(x), scale_factor=4, mode='bilinear')
+        x = self.up2(x, x2)
+        out2 = F.interpolate(self.side2(x), scale_factor=2, mode='bilinear')
+        x = self.up3(x, x1)
+        out = self.head(x)
+        out3 = F.interpolate(x4, scale_factor=8, mode='bilinear')
+        return out, torch.cat([out1, out2, out3], dim=1)
+
 class SAM2UNet(nn.Module):
     def __init__(self,model_cfg, checkpoint_path=None, stem="rangeformer", freeze_weight=False, adapter=False, msca=False, unify_dim=256, use_rfb=True) -> None:
         super(SAM2UNet, self).__init__()
@@ -179,7 +225,6 @@ class SAM2UNet(nn.Module):
     def forward(self, x):
         x1, x2, x3, x4 = self.encoder(x)
         out_main, out_aux = self.decoder((x1, x2, x3, x4))
-
         return out_main, out_aux
 
 if __name__ == "__main__":

@@ -369,8 +369,7 @@ class SemanticKitti(Dataset):
         path_split = path_norm.split(os.sep)
         path_seq = path_split[-3]
         path_name = path_split[-1].replace(".bin", ".label")
-        proj_full = torch.concat([proj_full, proj_mask.unsqueeze(0).float()], dim=0)
-
+        proj_full = proj_full * proj_mask.float()
         ### A simple version Cutline operation by JiadaiSun ###
         # if int(seq) in [0, 1, 2, 3, 4, 5, 6, 7, 9, 10]: # only for training sequences
         # 	if random.random() > 0.5:
