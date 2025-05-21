@@ -370,7 +370,7 @@ def train(rank, args):
     # ],
     #     weight_decay=args.weight_decay,
     # )
-    optimizer = AdamWScheduleFree(
+    optimizer = optim.AdamW(
     [
         {"params": other_params,    "lr": args.lr},   # heads, adapters, decoder
         {"params": backbone_params, "lr": args.lr / 10},   # fine‑tune SAM2 trunk
