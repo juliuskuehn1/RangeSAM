@@ -145,6 +145,42 @@ class Adapter(nn.Module):
         net = self.block(promped)
         return net
 
+class ImprovedAdapter(nn.Module):
+    """
+    SegFormer-style Adapter that can sit in front of a MultiScaleBlock.
+    Works for any spatial resolution because H and W are taken
+    from the input on every forward pass.
+    """
+    def __init__(self, blk):
+        super().__init__()
+        self.block = blk
+        dim = blk.attn.qkv.in_features          # = channel dim C
+
+        self.linear1 = nn.Linear(dim, dim*4)
+        # self.conv1 = nn.Conv2d(dim, dim*4, kernel_size=1)
+        self.dwconv  = nn.Conv2d(
+            dim*4, dim*4,
+            kernel_size=3, padding=1, groups=dim, bias=True
+        )
+        self.linear2 = nn.Linear(dim*4, dim)
+        # self.conv2 = nn.Conv2d(dim*4, dim, kernel_size=1)
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.linear1(x)                     # (B, H, W, C)
+        y = self.act(y)
+        y = y.permute(0, 3, 1, 2)               # (B, C, H, W)
+        #y = self.conv1(y)
+        y = self.dwconv(y)                      # (B, C, H, W)
+        y = self.act(y)
+        #y = self.conv2(y)
+        y = y.permute(0, 2, 3, 1)               # (B, H, W, C)
+        y = self.linear2(y)
+        y = self.act(y)
+        x = x + y                               
+        out = self.block(x)                     
+        return out
+
 
 class BasicConv2d(nn.Module):
     def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1):

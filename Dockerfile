@@ -40,6 +40,7 @@ RUN pip install typing_extensions
 RUN pip install scikit-learn
 RUN pip install open3d
 RUN pip install matplotlib
+RUN pip install schedulefree
 COPY train.py .
 COPY SAM2UNet.py .
 # Default command

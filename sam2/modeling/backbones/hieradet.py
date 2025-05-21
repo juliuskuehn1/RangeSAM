@@ -202,7 +202,7 @@ class Hiera(nn.Module):
 
         assert len(stages) == len(window_spec)
         self.window_spec = window_spec
-
+        print("Value of window spec:", window_spec)
         depth = sum(stages)
         self.q_stride = q_stride
         self.stage_ends = [sum(stages[:i]) - 1 for i in range(1, len(stages) + 1)]
@@ -218,6 +218,7 @@ class Hiera(nn.Module):
 
         # Windowed positional embedding (https://arxiv.org/abs/2311.05613)
         self.window_pos_embed_bkg_spatial_size = window_pos_embed_bkg_spatial_size
+        print("Value of window pos embed spatial size:", window_pos_embed_bkg_spatial_size)
         self.pos_embed = nn.Parameter(
             torch.zeros(1, embed_dim, *self.window_pos_embed_bkg_spatial_size)
         )

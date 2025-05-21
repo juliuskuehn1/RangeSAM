@@ -9,7 +9,7 @@ import torch
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import OneCycleLR
 from torch.cuda.amp import autocast, GradScaler
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -18,6 +18,7 @@ from RSAM import SAM2UNet
 from preprocess.parser import Parser, SemanticKitti
 from utils.utils import *
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from schedulefree import AdamWScheduleFree
 
 
 def soft_iou_loss(logits, mask, num_classes, smooth=1e-6, ignore_index=0):
@@ -208,13 +209,13 @@ def combined_loss(logits, mask, num_classes=20,
     return w_ce*ce + w_dice*d + w_lovasz*l + w_boundary*b
 
 
-
-def evaluate_metrics(model, dataloader, num_classes=20,
+def evaluate_metrics(model, optimizer, dataloader, num_classes=20,
                      ignore_index=0, device='cuda'):
     # build confusion matrix
     conf_matrix = torch.zeros((num_classes, num_classes),
                               dtype=torch.long, device=device)
     model.eval()
+    optimizer.eval()
     with torch.no_grad():
         for (in_vol, proj_mask, proj_labels, _, path_seq, path_name,
                 _, _, _, _, _, _, _, _, _) in dataloader:
@@ -341,11 +342,13 @@ def train(rank, args):
         adapter=args.adapter,
         msca=args.msca,
         unify_dim=args.unify_dim,   # e.g. 256
-        use_rfb=args.use_rfb        # True / False
+        use_rfb=args.use_rfb,        # True / False
+        pos_emb=args.pos_emb,
     ).to(device)
     model = torch.nn.parallel.DistributedDataParallel(
         model,
-        device_ids=[rank]
+        device_ids=[rank],
+        find_unused_parameters=True
     )
     backbone_params = []
     other_params    = []
@@ -360,17 +363,37 @@ def train(rank, args):
 
     assert backbone_params, "didn't catch any backbone parameters — check the name!"
     assert other_params,    "everything landed in the backbone group?"
-
-    optimizer = optim.AdamW(
+    # optimizer = optim.AdamW(
+    # [
+    #     {"params": other_params,    "lr": args.lr},   # heads, adapters, decoder
+    #     {"params": backbone_params, "lr": args.lr / 10},   # fine‑tune SAM2 trunk
+    # ],
+    #     weight_decay=args.weight_decay,
+    # )
+    optimizer = AdamWScheduleFree(
     [
-        {"params": other_params,    "lr": 1e-3},   # heads, adapters, decoder
-        {"params": backbone_params, "lr": 1e-4},   # fine‑tune SAM2 trunk
+        {"params": other_params,    "lr": args.lr},   # heads, adapters, decoder
+        {"params": backbone_params, "lr": args.lr / 10},   # fine‑tune SAM2 trunk
     ],
-    weight_decay=args.weight_decay,
-)
+        weight_decay=args.weight_decay,
+    )
+    
+    # steps_per_epoch = len(train_loader)  # local length on this rank
+    # scheduler = OneCycleLR(
+    #     optimizer,
+    #     max_lr=[args.lr, args.lr / 10],      # one value per param-group
+    #     epochs=args.epochs,
+    #     steps_per_epoch=steps_per_epoch,
+    #     pct_start=args.pct_start,
+    #     anneal_strategy="cos",               # smoother than "linear"
+    #     div_factor=args.div_factor,
+    #     final_div_factor=args.final_div_factor,
+    #     three_phase=args.three_phase,
+    # )
     os.makedirs(args.save_path, exist_ok=True)
     for epoch in range(1, args.epochs + 1):
         model.train()
+        optimizer.train()
         train_sampler.set_epoch(epoch)
         running_loss = 0.0
         for i, (in_vol, proj_mask, proj_labels, _, path_seq, path_name,
@@ -379,9 +402,11 @@ def train(rank, args):
             target = proj_labels.to(device, non_blocking=True).long()
             optimizer.zero_grad()
             out_main, out_aux= model(x)
-            loss = combined_loss(out_main, target)  + sum(combined_loss(aux_pred, target) for aux_pred in out_aux)
+            weights = [1.0, 1.0, 0.5, 0.25]
+            loss = combined_loss(out_main, target)  + sum(w * combined_loss(aux_pred, target) for w, aux_pred in zip(weights, out_aux))
             loss.backward()
             optimizer.step()
+            # scheduler.step()
             running_loss += loss.item()
             if rank == 0 and i % 50 == 0:
                 print(f"Epoch {epoch} [{i}/{len(train_loader)}]  Batch Loss: {loss.item():.4f}")
@@ -390,7 +415,7 @@ def train(rank, args):
             print(f"Epoch {epoch} Training Loss: {avg_train_loss:.4f}")
         
         if epoch % 5 == 0 or epoch == args.epochs:
-            metrics = evaluate_metrics(model.module, val_loader, num_classes=20, ignore_index=0, device=device)
+            metrics = evaluate_metrics(model.module, optimizer, val_loader, num_classes=20, ignore_index=0, device=device)
             if rank == 0:
                 print("Matrix:")
                 print(f"*** Validation metrics after epoch {epoch} ***")
@@ -422,11 +447,14 @@ if __name__ == "__main__":
                         help="training epochs")
     parser.add_argument("--lr", type=float, default=0.001, help="learning rate")
     parser.add_argument("--batch_size", default=4, type=int)
-    parser.add_argument("--use_rfb", default=True, type=bool)
-    parser.add_argument("--weight_decay", default=5e-4, type=float)
+    parser.add_argument("--use_rfb", default=False, type=str2bool)
+    parser.add_argument("--weight_decay", default=0.00025, type=float)
     parser.add_argument("--world_size", type=int, default=torch.cuda.device_count(),
                         help="number of GPUs for DDP")
     parser.add_argument("--unify_dim", type=int, default=256)
+    parser.add_argument("--pos_emb", default=False, type=str2bool)
+
+
     args = parser.parse_args()
     print("Parsed Arguments:")
     for arg, value in vars(args).items():
