@@ -156,6 +156,48 @@ def boundary_loss(logits, mask, num_classes, ignore_index=0):
     b_loss = (diff * boundary_map).sum() / (boundary_map.sum() + 1e-6)
     return b_loss
 
+# new boundary loss
+
+def new_boundary_loss(logits, mask, theta0=3):
+    """
+    Compute the boundary F1 loss between prediction and ground-truth,
+    ignoring class 0.
+    """
+    N, C, H, W = logits.shape
+    # 1) probabilities
+    pred = F.softmax(logits, dim=1)               # [N,C,H,W]
+
+    # 2) one‐hot encode gt
+    one_hot = F.one_hot(mask, num_classes=C)      # [N,H,W,C]
+    one_hot = one_hot.permute(0,3,1,2).float()    # [N,C,H,W]
+
+    # 3) extract class‐wise boundary maps
+    pad = (theta0 - 1) // 2
+    gt_b   = F.max_pool2d(1 - one_hot, kernel_size=theta0, stride=1, padding=pad) \
+             - (1 - one_hot)
+    pred_b = F.max_pool2d(1 - pred,    kernel_size=theta0, stride=1, padding=pad) \
+             - (1 - pred)
+
+    # 4) drop class 0
+    gt_b   = gt_b[:, 1:, :, :]   # now [N, C-1, H, W]
+    pred_b = pred_b[:, 1:, :, :]
+    C1 = C - 1
+
+    # 5) flatten spatial dims
+    gt_b   = gt_b.view(N, C1, -1)     # [N, C-1, H*W]
+    pred_b = pred_b.view(N, C1, -1)
+
+    # 6) precision & recall per class
+    eps = 1e-7
+    inter = (pred_b * gt_b).sum(dim=2)                   # [N, C1]
+    P = inter / (pred_b.sum(dim=2) + eps)
+    R = inter / (gt_b.sum(dim=2)   + eps)
+
+    # 7) boundary F1 and loss
+    BF1  = 2 * P * R / (P + R + eps)    # [N, C1]
+    loss = 1 - BF1
+
+    return loss.mean()
 
 # -----------------------------------------------------------------------------
 # 4) Combined loss
@@ -204,7 +246,7 @@ def combined_loss(logits, mask, num_classes=20,
     # 3) Lovasz
     l  = lovasz_softmax(logits, mask, ignore_index=0)
     # 4) Boundary
-    b  = boundary_loss(logits, mask, num_classes, ignore_index=0)
+    b  = new_boundary_loss(logits, mask)
 
     return w_ce*ce + w_dice*d + w_lovasz*l + w_boundary*b
 
@@ -215,7 +257,7 @@ def evaluate_metrics(model, optimizer, dataloader, num_classes=20,
     conf_matrix = torch.zeros((num_classes, num_classes),
                               dtype=torch.long, device=device)
     model.eval()
-    optimizer.eval()
+    # optimizer.eval()
     with torch.no_grad():
         for (in_vol, proj_mask, proj_labels, _, path_seq, path_name,
                 _, _, _, _, _, _, _, _, _) in dataloader:
@@ -393,7 +435,7 @@ def train(rank, args):
     os.makedirs(args.save_path, exist_ok=True)
     for epoch in range(1, args.epochs + 1):
         model.train()
-        optimizer.train()
+        # optimizer.train()
         train_sampler.set_epoch(epoch)
         running_loss = 0.0
         for i, (in_vol, proj_mask, proj_labels, _, path_seq, path_name,
@@ -453,8 +495,7 @@ if __name__ == "__main__":
                         help="number of GPUs for DDP")
     parser.add_argument("--unify_dim", type=int, default=256)
     parser.add_argument("--pos_emb", default=False, type=str2bool)
-
-
+    ##########
     args = parser.parse_args()
     print("Parsed Arguments:")
     for arg, value in vars(args).items():
