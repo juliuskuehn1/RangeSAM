@@ -157,10 +157,10 @@ class RSAMRFEncoder(nn.Module):
         for dim in [out_channels, out_channels*2, out_channels*4, out_channels*8]:
             msca_blocks.append(SpatialAttention(dim))
         blocks = []
-        for block in self.backbone.blocks:
-            blocks.append(
-                ImprovedAdapter(block)
-            )
+        # for block in self.backbone.blocks:
+        #     blocks.append(
+        #         ImprovedAdapter(block)
+        #     )
         self.backbone.blocks = nn.Sequential(
             *blocks
         )

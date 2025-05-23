@@ -186,14 +186,15 @@ class RSAMRFEncoder(nn.Module):
             nn.GroupNorm(1, out_channels*4),
             nn.GroupNorm(1, out_channels*8),
         ])
-        self.window_spec = [8, 4, 14, 7]
-        self.window_pos_embed_bkg_spatial_size = [1, 32]
-        self.pos_embed_window = nn.Parameter(
-            torch.zeros(1, 96, self.window_spec[0], self.window_spec[0])
-        )
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, 96, *self.window_pos_embed_bkg_spatial_size)
-        )
+        if (self.pos_emb):
+            self.window_spec = [8, 4, 14, 7]
+            self.window_pos_embed_bkg_spatial_size = [1, 32]
+            self.pos_embed_window = nn.Parameter(
+                torch.zeros(1, 96, self.window_spec[0], self.window_spec[0])
+            )
+            self.pos_embed = nn.Parameter(
+                torch.zeros(1, 96, *self.window_pos_embed_bkg_spatial_size)
+            )
         
     def _get_pos_embed(self) -> torch.Tensor:
         h, w = 64, 2048
