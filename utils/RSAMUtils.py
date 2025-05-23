@@ -144,6 +144,64 @@ class Adapter(nn.Module):
         promped = x + prompt
         net = self.block(promped)
         return net
+    
+def stage_id_for_block(idx: int) -> int:
+    # cumulative lengths of stages
+    # stage 0: 0               (1 block)          -> indices 0
+    # stage 1: 1 ..  2         (2 blocks)         -> indices 1-2
+    # stage 2: 3 ..  9         (7 blocks)         -> indices 3-9
+    # stage 3: 10 .. 11        (2 blocks)         -> indices 10-11
+    if   idx == 0:                    return 0   # stage-1
+    elif 1 <= idx <= 2:               return 1   # stage-2
+    elif 3 <= idx <= 9:               return 2   # stage-3
+    elif 10 <= idx <= 11:             return 3   # stage-4
+    else:
+        raise ValueError(f"unexpected block index {idx}")
+
+# mapping stage-id ➜ number of 3×3 convolutions
+NUM_CONVS_PER_STAGE = {0: 0, 1: 1, 2: 2, 3: 3}
+
+class ImprovedAdapterSep(nn.Module):
+    """
+    Same idea, but each 3×3 depth-wise conv is factorised
+    into a depth-wise 1×3 followed by 3×1.
+    """
+    def __init__(self, blk: nn.Module, num_convs: int = 1):
+        super().__init__()
+        self.block = blk
+        self.dim   = blk.attn.qkv.in_features
+
+        self.linear1 = nn.Linear(self.dim, self.dim * 4)
+        self.linear2 = nn.Linear(self.dim * 4, self.dim)
+        self.act     = nn.GELU()
+
+        convs = []
+        if (num_convs == 0):
+            convs.extend([
+                nn.Conv2d(self.dim * 4, self.dim * 4, kernel_size=1, groups=self.dim, bias=True),
+                nn.GELU(),
+            ])
+        for _ in range(num_convs):
+            convs.extend([
+                nn.Conv2d(self.dim * 4, self.dim * 4,
+                          kernel_size=(1, 3), padding=(0, 1),
+                          groups=self.dim, bias=True),
+                nn.GELU(),
+                nn.Conv2d(self.dim * 4, self.dim * 4,
+                          kernel_size=(3, 1), padding=(1, 0),
+                          groups=self.dim, bias=True),
+                nn.GELU(),
+            ])
+        self.dw_stack = nn.Sequential(*convs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:R
+        y = self.act(self.linear1(x))
+        y = y.permute(0, 3, 1, 2)
+        y = self.dw_stack(y)
+        y = y.permute(0, 2, 3, 1)
+        y = self.act(self.linear2(y))
+        out = self.block(x + y)
+        return out
 
 class ImprovedAdapter(nn.Module):
     """

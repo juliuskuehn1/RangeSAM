@@ -14,12 +14,13 @@ from torch.cuda.amp import autocast, GradScaler
 import torch.distributed as dist
 import torch.multiprocessing as mp
 #from kitti_dataloader import MultiSeqNpZDataset, Seq02NpZDataset
-from RSAM import SAM2UNet
+from RSAMconv import SAM2UNet
 from preprocess.parser import Parser, SemanticKitti
 from utils.utils import *
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 from schedulefree import AdamWScheduleFree
 
+torch.set_float32_matmul_precision('high')
 
 def soft_iou_loss(logits, mask, num_classes, smooth=1e-6, ignore_index=0):
     probs = F.softmax(logits, dim=1)
@@ -389,9 +390,9 @@ def train(rank, args):
     ).to(device)
     model = torch.nn.parallel.DistributedDataParallel(
         model,
-        device_ids=[rank],
-        find_unused_parameters=True
+        device_ids=[rank]
     )
+    model = torch.compile(model)
     backbone_params = []
     other_params    = []
 

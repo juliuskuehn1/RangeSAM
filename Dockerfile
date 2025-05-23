@@ -33,6 +33,9 @@ RUN pip install --upgrade pip
 ENV SAM2_BUILD_ALLOW_ERRORS=1
 RUN pip install -e .
 
+# Fix for MKL threading
+ENV MKL_THREADING_LAYER=GNU
+
 # RUN pip install ".[notebooks]" ".[interactive-demo]"
 RUN pip uninstall -y typing_extensions
 RUN pip uninstall -y typing_extensions
