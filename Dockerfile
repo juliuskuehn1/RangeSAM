@@ -44,6 +44,8 @@ RUN pip install scikit-learn
 RUN pip install open3d
 RUN pip install matplotlib
 RUN pip install schedulefree
+RUN pip install -U catalyst
+
 COPY train.py .
 COPY SAM2UNet.py .
 # Default command

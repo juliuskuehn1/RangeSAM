@@ -9,7 +9,7 @@ import torch
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torch.cuda.amp import autocast, GradScaler
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -70,6 +70,39 @@ def dice_loss(logits, mask, num_classes, ignore_index=0, smooth=1e-6):
     # drop the void class
     dice = dice[1:]
     return 1.0 - dice.mean()
+
+# Focal loss entropy
+
+def focal_cross_entropy(logits, mask, gamma=2.0, alpha=None, ignore_index=0, reduction='mean'):
+    """
+    Focal loss with optional per-class α weighting.
+      logits:     [B, C, H, W]
+      mask:       [B, H, W] integer labels in [0..C-1]
+      gamma:      focusing parameter
+      alpha:      tensor[C] of class weights, or None
+    """
+    # 1) standard per-pixel CE
+    ce = F.cross_entropy(logits, mask,
+                         ignore_index=ignore_index,
+                         reduction='none')           # [B,H,W]
+    p_t = torch.exp(-ce)                       # [B,H,W] prob of true class
+
+    # 2) focal scaling
+    loss = (1 - p_t)**gamma * ce               # [B,H,W]
+
+    # 3) α weighting
+    if alpha is not None:
+        # mask.clamp to avoid indexing -1 for ignore_index
+        idx = mask.clamp(min=0)        # still [B,H,W]
+        a   = alpha[idx]               # now [B,H,W]
+        loss = a * loss
+
+    # 4) mask out ignore_index
+    if ignore_index is not None:
+        loss = loss[mask != ignore_index]
+
+    return loss.mean() if reduction=='mean' else loss.sum()
+
 
 
 # -----------------------------------------------------------------------------
@@ -204,7 +237,7 @@ def new_boundary_loss(logits, mask, theta0=3):
 # 4) Combined loss
 # -----------------------------------------------------------------------------
 def combined_loss(logits, mask, num_classes=20,
-                  w_ce=0.5, w_dice=0.5, w_lovasz=1.5, w_boundary=1):
+                  w_ce=1.5, w_dice=0.5, w_lovasz=1.5, w_boundary=1):
     """
     A mix of four losses:
       - standard cross-entropy
@@ -240,8 +273,13 @@ def combined_loss(logits, mask, num_classes=20,
     w_c[0] = 0.0                         # ignore void
     w_c = w_c * (len(w_c) / w_c.sum())
     # 1) CE (ignore void)
-    ce = F.cross_entropy(logits, mask,
-                         ignore_index=0, reduction='mean', weight=w_c)
+    ce = focal_cross_entropy(
+                logits,
+                mask,
+                gamma=2.0,
+                alpha=w_c,         # ← your class weights here
+                ignore_index=0
+            )
     # 2) Dice
     d  = dice_loss(logits, mask, num_classes, ignore_index=0)
     # 3) Lovasz
@@ -252,7 +290,7 @@ def combined_loss(logits, mask, num_classes=20,
     return w_ce*ce + w_dice*d + w_lovasz*l + w_boundary*b
 
 
-def evaluate_metrics(model, optimizer, dataloader, num_classes=20,
+def evaluate_metrics(model, dataloader, num_classes=20,
                      ignore_index=0, device='cuda'):
     # build confusion matrix
     conf_matrix = torch.zeros((num_classes, num_classes),
@@ -304,6 +342,93 @@ def evaluate_metrics(model, optimizer, dataloader, num_classes=20,
         'mean_acc': mean_acc,
         'miou': miou,
         'fw_iou': fw_iou,
+    }
+    
+@torch.no_grad()
+def evaluate_metrics_ddp(model,
+                         dataloader,
+                         num_classes: int = 20,
+                         ignore_index: int = 0,
+                         device: torch.device | None = None):
+    """
+    Computes pixel-accuracy, mean-accuracy, mIoU and fwIoU on the *full*
+    validation set in a DDP run.
+
+    • Each rank accumulates its local confusion-matrix.  
+    • `dist.all_reduce` sums those matrices across ranks.  
+    • Rank 0 returns/prints the metrics (others still return a dict so the
+      call is symmetric).
+
+    NOTE: the DataLoader may still use DistributedSampler; that is fine as
+    long as we aggregate here.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    # full C×C confusion matrix on *this* GPU
+    conf = torch.zeros(num_classes,
+                       num_classes,
+                       dtype=torch.long,
+                       device=device)
+
+    model.eval()
+    for batch in dataloader:
+        in_vol      = batch[0].to(device, non_blocking=True)   # projected voxels
+        target      = batch[2].to(device, non_blocking=True)   # proj_labels
+        logits, _   = model(in_vol)                            # forward
+        pred        = logits.argmax(1)
+
+        valid = target != ignore_index
+        t     = target[valid].view(-1)
+        p     = pred[valid].view(-1)
+        idx   = num_classes * t + p
+        conf += torch.bincount(idx,
+                               minlength=num_classes**2
+                               ).view(num_classes, num_classes)
+
+    # ---- gather from every GPU ----
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(conf, op=dist.ReduceOp.SUM)
+
+    # ---- derive metrics ----
+    total   = conf.sum().item()
+    correct = conf.trace().item()
+    pixel_acc = correct / total if total else 0.0
+
+    class_acc = []
+    ious, freqs = [], []
+    for cls in range(num_classes):
+        if cls == ignore_index:
+            continue
+        gt = conf[cls].sum().item()
+        if gt:
+            class_acc.append(conf[cls, cls].item() / gt)
+
+        tp = conf[cls, cls].item()
+        fp = conf[:, cls].sum().item() - tp
+        fn = conf[cls, :].sum().item() - tp
+        denom = tp + fp + fn
+        if denom:
+            iou = tp / denom
+            ious.append(iou)
+            freqs.append(conf[cls, :].sum().item() / total)
+            
+    cls_list = [c for c in range(num_classes) if c != ignore_index]
+    per_class_iou = {
+        cls: float(iou)
+        for cls, iou in zip(cls_list, ious)
+    }
+    
+    mean_acc = sum(class_acc) / len(class_acc) if class_acc else 0.0
+    miou     = sum(ious)      / len(ious)      if ious      else 0.0
+    fw_iou   = sum(f * i for f, i in zip(freqs, ious))       if ious else 0.0
+
+    return {
+        "pixel_acc": pixel_acc,
+        "mean_acc":  mean_acc,
+        "miou":      miou,
+        "fw_iou":    fw_iou,
+        "per_class_iou": per_class_iou
     }
 
 
@@ -367,7 +492,7 @@ def initiate_parser(rank, world_size, batch_size):
                                                    sampler=val_sampler,
                                                    num_workers=8,
                                                    pin_memory=True,
-                                                   drop_last=True)
+                                                   drop_last=False)
     return trainloader, validloader, train_sampler, val_sampler
 
 
@@ -406,13 +531,6 @@ def train(rank, args):
 
     assert backbone_params, "didn't catch any backbone parameters — check the name!"
     assert other_params,    "everything landed in the backbone group?"
-    # optimizer = optim.AdamW(
-    # [
-    #     {"params": other_params,    "lr": args.lr},   # heads, adapters, decoder
-    #     {"params": backbone_params, "lr": args.lr / 10},   # fine‑tune SAM2 trunk
-    # ],
-    #     weight_decay=args.weight_decay,
-    # )
     optimizer = optim.AdamW(
     [
         {"params": other_params,    "lr": args.lr},   # heads, adapters, decoder
@@ -420,19 +538,29 @@ def train(rank, args):
     ],
         weight_decay=args.weight_decay,
     )
+    steps_per_epoch = len(train_loader)            # batches per epoch on this GPU
+    warmup_epochs   = args.warmup_epochs
+    warmup_steps    = warmup_epochs * steps_per_epoch
+    total_steps     = args.epochs * steps_per_epoch
     
-    # steps_per_epoch = len(train_loader)  # local length on this rank
-    # scheduler = OneCycleLR(
-    #     optimizer,
-    #     max_lr=[args.lr, args.lr / 10],      # one value per param-group
-    #     epochs=args.epochs,
-    #     steps_per_epoch=steps_per_epoch,
-    #     pct_start=args.pct_start,
-    #     anneal_strategy="cos",               # smoother than "linear"
-    #     div_factor=args.div_factor,
-    #     final_div_factor=args.final_div_factor,
-    #     three_phase=args.three_phase,
-    # )
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=args.warmup_start_factor,     # e.g. 0.1
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps - warmup_steps,
+        eta_min=args.min_lr,                       # e.g. 1e-6
+    )
+
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_steps],                 # switch after warm-up
+    )
     os.makedirs(args.save_path, exist_ok=True)
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -449,16 +577,17 @@ def train(rank, args):
             loss = combined_loss(out_main, target)  + sum(w * combined_loss(aux_pred, target) for w, aux_pred in zip(weights, out_aux))
             loss.backward()
             optimizer.step()
-            # scheduler.step()
+            scheduler.step()
             running_loss += loss.item()
             if rank == 0 and i % 50 == 0:
                 print(f"Epoch {epoch} [{i}/{len(train_loader)}]  Batch Loss: {loss.item():.4f}")
+                
         if rank == 0:
             avg_train_loss = running_loss / len(train_loader)
             print(f"Epoch {epoch} Training Loss: {avg_train_loss:.4f}")
         
         if epoch % 5 == 0 or epoch == args.epochs:
-            metrics = evaluate_metrics(model.module, optimizer, val_loader, num_classes=20, ignore_index=0, device=device)
+            metrics = evaluate_metrics_ddp(model.module, val_loader, num_classes=20, ignore_index=0, device=device)
             if rank == 0:
                 print("Matrix:")
                 print(f"*** Validation metrics after epoch {epoch} ***")
@@ -466,6 +595,9 @@ def train(rank, args):
                 print(f"  Mean  Acc: {metrics['mean_acc']:.4f}")
                 print(f"  mIoU     : {metrics['miou']:.4f}")
                 print(f"  fwIoU    : {metrics['fw_iou']:.4f}")
+                print("Per-class IoUs:")
+                for cls, iou in metrics['per_class_iou'].items():
+                    print(f"  Class {cls:2d}: {iou:.4f}")
                 ckpt = os.path.join(args.save_path, f'SAM2-UNet-epoch{epoch}-rank{rank}.pth')
                 torch.save(model.module.state_dict(), ckpt)
                 print(f"[Saved Snapshot:] {ckpt}")
@@ -496,6 +628,12 @@ if __name__ == "__main__":
                         help="number of GPUs for DDP")
     parser.add_argument("--unify_dim", type=int, default=256)
     parser.add_argument("--pos_emb", default=False, type=str2bool)
+    parser.add_argument("--warmup_epochs",       type=int,   default=5,
+                    help="linear warm-up duration (in epochs)")
+    parser.add_argument("--warmup_start_factor", type=float, default=0.1,
+                        help="initial LR = base_lr × start_factor during warm-up")
+    parser.add_argument("--min_lr",              type=float, default=1e-6,
+                        help="η_min for cosine annealing phase")
     ##########
     args = parser.parse_args()
     print("Parsed Arguments:")

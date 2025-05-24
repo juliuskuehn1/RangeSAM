@@ -194,7 +194,7 @@ class ImprovedAdapterSep(nn.Module):
             ])
         self.dw_stack = nn.Sequential(*convs)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.act(self.linear1(x))
         y = y.permute(0, 3, 1, 2)
         y = self.dw_stack(y)

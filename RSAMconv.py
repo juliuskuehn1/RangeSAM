@@ -174,11 +174,17 @@ class RSAMRFEncoder(nn.Module):
         self.backbone.blocks = adapted_blocks
         self.msca_blocks = nn.ModuleList(msca_blocks)
         self.dropout = nn.Dropout2d(p=0.2)
-        self.conv = nn.ModuleList([
+        self.conv1 = nn.ModuleList([
             nn.Conv2d(out_channels, out_channels, 3, padding=1),
             nn.Conv2d(out_channels*2, out_channels*2, 3, padding=1),
             nn.Conv2d(out_channels*4, out_channels*4, 3, padding=1),
             nn.Conv2d(out_channels*8, out_channels*8, 3, padding=1),
+        ])
+        self.conv2 = nn.ModuleList([
+            nn.Conv2d(out_channels, out_channels, 1),
+            nn.Conv2d(out_channels*2, out_channels*2, 1),
+            nn.Conv2d(out_channels*4, out_channels*4, 1),
+            nn.Conv2d(out_channels*8, out_channels*8, 1),
         ])
         self.norm = nn.ModuleList([
             nn.GroupNorm(1, out_channels*1),
@@ -218,10 +224,11 @@ class RSAMRFEncoder(nn.Module):
             x = blk(x)
             if i in self.backbone.stage_ends:
                 feat = x.permute(0, 3, 1, 2)
-                out = self.conv[stage_idx](feat)
+                out = self.conv1[stage_idx](feat)
                 out = self.norm[stage_idx](out)
                 out = self.dropout(self.msca_blocks[stage_idx](feat)) + out
                 feat = feat + out
+                feat = self.conv2[stage_idx](feat)
                 outputs.append(feat)
                 x = feat.permute(0, 2, 3, 1)
                 stage_idx += 1
@@ -242,7 +249,15 @@ class RSAMDecoder(nn.Module):
             self.conv3 = nn.Conv2d(out_channels*4, unify_dim, kernel_size=1)
             self.conv4 = nn.Conv2d(out_channels*8, unify_dim, kernel_size=1)
         self.main_head = nn.Sequential(
-            nn.Conv2d(unify_dim * 4, unify_dim * 1, 1),
+            nn.Conv2d(unify_dim * 4, unify_dim * 3, 1),
+            nn.GroupNorm(1, unify_dim * 3),
+            nn.GELU(),
+            nn.Conv2d(unify_dim * 3, unify_dim * 2, 1),
+            nn.GroupNorm(1, unify_dim * 2),
+            nn.GELU(),
+            nn.Conv2d(unify_dim * 2, unify_dim * 1, 1),
+            nn.GroupNorm(1, unify_dim * 1),
+            nn.GELU(),
             nn.Conv2d(unify_dim * 1, 20, 1)
         )
         self.aux_heads = nn.ModuleList([
