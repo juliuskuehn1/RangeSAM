@@ -22,57 +22,42 @@ from schedulefree import AdamWScheduleFree
 
 torch.set_float32_matmul_precision('high')
 
-def soft_iou_loss(logits, mask, num_classes, smooth=1e-6, ignore_index=0):
-    probs = F.softmax(logits, dim=1)
-    with torch.no_grad():
-        gt = torch.eye(num_classes, device=mask.device)[mask]
-        gt = gt.permute(0,3,1,2).float()
-    valid = (mask != ignore_index).unsqueeze(1).float()
-    probs = probs * valid
-    gt    = gt    * valid
-    dims = (0,2,3)
-    intersection = probs.mul(gt).sum(dim=dims)
-    total        = probs.add(gt).sum(dim=dims)
-    union        = total - intersection
-    iou = (intersection + smooth) / (union + smooth)
-    iou = torch.cat([iou[:ignore_index], iou[ignore_index+1:]], dim=0)
-    return 1.0 - iou.mean()
+def class_balanced_mean(loss, mask, ignore_index=0, num_classes=None):
+    """
+    loss:       torch.Tensor of shape [B,H,W], no reduction yet
+    mask:       torch.LongTensor of shape [B,H,W]
+    ignore_index:  label to ignore
+    num_classes:   total # of classes C  (including ignore)
+    """
+    if num_classes is None:
+        num_classes = int(mask.max()) + 1
 
+    # 1) flatten and mask
+    valid = (mask != ignore_index)
+    loss_flat = loss[valid]                # [N_valid]
+    mask_flat = mask[valid]                # [N_valid]
 
-def structure_loss(logits, mask, num_classes=20,
-                   weight_ce=0.3, weight_iou=0.7):
-    ce = F.cross_entropy(logits, mask,
-                         ignore_index=0,
-                         reduction='mean')
-    iou = soft_iou_loss(logits, mask, num_classes,
-                        ignore_index=0)
-    return weight_ce * ce + weight_iou * iou
+    # 2) compute per-class sums and counts
+    C = num_classes
+    device = loss.device
+    sum_per_class   = torch.zeros(C, device=device)
+    count_per_class = torch.zeros(C, device=device)
+
+    sum_per_class   = sum_per_class.scatter_add(0, mask_flat, loss_flat)
+    count_per_class = count_per_class.scatter_add(0, mask_flat, torch.ones_like(loss_flat))
+
+    # 3) for each class present, compute its mean
+    present = count_per_class > 0
+    mean_per_class = sum_per_class[present] / count_per_class[present]
+
+    # 4) average the class-means
+    if mean_per_class.numel() == 0:
+        return torch.tensor(0.0, device=device)
+    return mean_per_class.mean()
 
 # -----------------------------------------------------------------------------
 # 1) Dice loss (soft, averaged over classes 1…C-1)
 # -----------------------------------------------------------------------------
-def dice_loss(logits, mask, num_classes, ignore_index=0, smooth=1e-6):
-    probs = F.softmax(logits, dim=1)                              # [B,C,H,W]
-    # one-hot GT
-    gt = F.one_hot(mask.clamp(min=0), num_classes)                # [B,H,W,C]
-    gt = gt.permute(0,3,1,2).float()                              # [B,C,H,W]
-    # mask out ignore_index
-    valid = (mask != ignore_index).unsqueeze(1).float()           # [B,1,H,W]
-    probs = probs * valid
-    gt    = gt    * valid
-
-    # per-class intersection & union
-    dims = (0,2,3)
-    inter = (probs * gt).sum(dims)                                # [C]
-    union = probs.sum(dims) + gt.sum(dims)                        # [C]
-    dice  = (2*inter + smooth) / (union + smooth)                 # [C]
-
-    # drop the void class
-    dice = dice[1:]
-    return 1.0 - dice.mean()
-
-# Focal loss entropy
-
 def focal_cross_entropy(logits, mask, gamma=2.0, alpha=None, ignore_index=0, reduction='mean'):
     """
     Focal loss with optional per-class α weighting.
@@ -96,12 +81,8 @@ def focal_cross_entropy(logits, mask, gamma=2.0, alpha=None, ignore_index=0, red
         idx = mask.clamp(min=0)        # still [B,H,W]
         a   = alpha[idx]               # now [B,H,W]
         loss = a * loss
-
-    # 4) mask out ignore_index
-    if ignore_index is not None:
-        loss = loss[mask != ignore_index]
-
-    return loss.mean() if reduction=='mean' else loss.sum()
+        
+    return class_balanced_mean(loss, mask, ignore_index=0, num_classes=20)
 
 
 
@@ -153,45 +134,6 @@ def lovasz_softmax(logits, mask, ignore_index=0):
 # -----------------------------------------------------------------------------
 # 3) Boundary loss (penalize mistakes near class edges)
 # -----------------------------------------------------------------------------
-def boundary_loss(logits, mask, num_classes, ignore_index=0):
-    # compute a simple boundary map from GT via Sobel filters
-    with torch.no_grad():
-        gt = F.one_hot(mask.clamp(min=0), num_classes)            # [B,H,W,C]
-        gt = gt.permute(0,3,1,2).float()                           # [B,C,H,W]
-        # only consider real classes
-        gt = gt[:,1:,:,:]
-        # Sobel kernels
-        kx = torch.tensor(
-            [[1.0, 0.0, -1.0],
-             [2.0, 0.0, -2.0],
-             [1.0, 0.0, -1.0]],
-            dtype=torch.float32,
-            device=gt.device
-        ).view(1, 1, 3, 3)
-
-        ky = kx.transpose(2, 3)  # still float, same device
-        edges = []
-        for c in range(gt.size(1)):
-            g = gt[:,c:c+1]
-            ex = F.conv2d(g, kx, padding=1)
-            ey = F.conv2d(g, ky, padding=1)
-            edges.append(torch.sqrt(ex**2 + ey**2))
-        boundary_map = torch.clamp(torch.cat(edges,1), 0, 1)       # [B,C-1,H,W]
-        # collapse to a single-channel weight
-        boundary_map = boundary_map.max(dim=1, keepdim=True)[0]   # [B,1,H,W]
-
-    probs = F.softmax(logits, dim=1)                              # [B,C,H,W]
-    one_hot = F.one_hot(mask.clamp(min=0), num_classes)           # [B,H,W,C]
-    one_hot = one_hot.permute(0,3,1,2).float()                    # [B,C,H,W]
-    valid = (mask != ignore_index).unsqueeze(1).float()           # [B,1,H,W]
-
-    diff = (probs - one_hot).abs() * valid                        # [B,C,H,W]
-    # weight only boundary pixels
-    b_loss = (diff * boundary_map).sum() / (boundary_map.sum() + 1e-6)
-    return b_loss
-
-# new boundary loss
-
 def new_boundary_loss(logits, mask, theta0=3):
     """
     Compute the boundary F1 loss between prediction and ground-truth,
@@ -237,7 +179,7 @@ def new_boundary_loss(logits, mask, theta0=3):
 # 4) Combined loss
 # -----------------------------------------------------------------------------
 def combined_loss(logits, mask, num_classes=20,
-                  w_ce=1.5, w_dice=0.5, w_lovasz=1.5, w_boundary=1):
+                  w_ce=1.5, w_lovasz=1.5, w_boundary=1):
     """
     A mix of four losses:
       - standard cross-entropy
@@ -268,26 +210,29 @@ def combined_loss(logits, mask, num_classes=20,
     0.00061559580861899,  # 19: traffic-sign
     ], dtype=torch.float32, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
     eps    = 1e-6
-    median = freqs[1:].median()    
-    w_c    = median / (freqs + eps)      # up‐weight rare classes
+    median = freqs[1:].median()
+    p = 1.5    
+    w_c    = median / (freqs + eps)       # up‐weight rare classes
     w_c[0] = 0.0                         # ignore void
-    w_c = w_c * (len(w_c) / w_c.sum())
+    # w_c = w_c * (len(w_c) / w_c.sum())
     # 1) CE (ignore void)
-    ce = focal_cross_entropy(
-                logits,
-                mask,
-                gamma=2.0,
-                alpha=w_c,         # ← your class weights here
-                ignore_index=0
-            )
-    # 2) Dice
-    d  = dice_loss(logits, mask, num_classes, ignore_index=0)
+    # ce = focal_cross_entropy(
+    #             logits,
+    #             mask,
+    #             gamma=2.0,
+    #             alpha=w_c,         # ← your class weights here
+    #             ignore_index=0
+    #         )
+    ce = F.cross_entropy(logits, mask,
+                         weight=w_c,
+                         ignore_index=0,
+                         reduction='none')
     # 3) Lovasz
     l  = lovasz_softmax(logits, mask, ignore_index=0)
     # 4) Boundary
     b  = new_boundary_loss(logits, mask)
 
-    return w_ce*ce + w_dice*d + w_lovasz*l + w_boundary*b
+    return w_ce*ce + w_lovasz*l + w_boundary*b
 
 
 def evaluate_metrics(model, dataloader, num_classes=20,
@@ -524,6 +469,9 @@ def train(rank, args):
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue                      # frozen → skip completely
+        # 1) if it's any of the pos-embeddings in the backbone, treat it as "other"
+        if "encoder.backbone" in n and "pos_embed" in n:
+            other_params.append(p)
         if "encoder.backbone" in n:       # <- matches the SAM2 trunk you kept
             backbone_params.append(p)     #    (adapt the string if you renamed)
         else:

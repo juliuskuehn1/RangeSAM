@@ -135,8 +135,10 @@ class RSAMRFEncoder(nn.Module):
         del model.obj_ptr_proj
         del model.image_encoder.neck
         self.backbone = model.image_encoder.trunk
-        del self.backbone.pos_embed
-        del self.backbone.pos_embed_window
+        self.pos_emb = pos_emb
+        if not self.pos_emb:
+            del self.backbone.pos_embed
+            del self.backbone.pos_embed_window
         self.stem = self.backbone.patch_embed.proj
         self.pos_emb = pos_emb
         out_channels = self.backbone.patch_embed.proj.out_channels
@@ -192,32 +194,32 @@ class RSAMRFEncoder(nn.Module):
             nn.GroupNorm(1, out_channels*4),
             nn.GroupNorm(1, out_channels*8),
         ])
-        if (self.pos_emb):
-            self.window_spec = [8, 4, 14, 7]
-            self.window_pos_embed_bkg_spatial_size = [1, 32]
-            self.pos_embed_window = nn.Parameter(
-                torch.zeros(1, 96, self.window_spec[0], self.window_spec[0])
-            )
-            self.pos_embed = nn.Parameter(
-                torch.zeros(1, 96, *self.window_pos_embed_bkg_spatial_size)
-            )
+        # if (self.pos_emb):
+        #     self.window_spec = [8, 4, 14, 7]
+        #     self.window_pos_embed_bkg_spatial_size = [1, 32]
+        #     self.pos_embed_window = nn.Parameter(
+        #         torch.zeros(1, 96, self.window_spec[0], self.window_spec[0])
+        #     )
+        #     self.pos_embed = nn.Parameter(
+        #         torch.zeros(1, 96, *self.window_pos_embed_bkg_spatial_size)
+        #     )
         
-    def _get_pos_embed(self) -> torch.Tensor:
-        h, w = 64, 2048
-        window_embed = self.pos_embed_window
-        pos_embed = F.interpolate(self.pos_embed, size=(h, w), mode="bicubic")
-        pos_embed = pos_embed + window_embed.tile(
-            [x // y for x, y in zip(pos_embed.shape, window_embed.shape)]
-        )
-        pos_embed = pos_embed.permute(0, 2, 3, 1)
-        return pos_embed
+    # def _get_pos_embed(self) -> torch.Tensor:
+    #     h, w = 64, 2048
+    #     window_embed = self.pos_embed_window
+    #     pos_embed = F.interpolate(self.pos_embed, size=(h, w), mode="bicubic")
+    #     pos_embed = pos_embed + window_embed.tile(
+    #         [x // y for x, y in zip(pos_embed.shape, window_embed.shape)]
+    #     )
+    #     pos_embed = pos_embed.permute(0, 2, 3, 1)
+    #     return pos_embed
 
     def forward(self, x):
         x = self.stem(x)
         x = x.permute(0, 2, 3, 1)
         # x = x + self.backbone._get_pos_embed(x.shape[1:3])
         if (self.pos_emb):
-            x = x + self._get_pos_embed()
+            x = x + self.backbone._get_pos_embed(x.shape[1:3])
         outputs = []
         stage_idx = 0
         for i, blk in enumerate(self.backbone.blocks):
@@ -292,7 +294,7 @@ class SAM2UNet(nn.Module):
         
         self.encoder = RSAMRFEncoder(model_cfg=model_cfg, checkpoint_path=checkpoint_path, stem=stem,
                                 freeze_weight=freeze_weight, adapter=adapter, msca=msca, pos_emb=pos_emb)
-        self.decoder = RSAMDecoder(out_channels = out_channels, unify_dim=unify_dim, use_rfb=use_rfb)
+        self.decoder = RSAMDecoder(out_channels=out_channels, unify_dim=unify_dim, use_rfb=use_rfb)
         # self.decoder = SegFormerDecoder(
         # embed_dims=[out_channels,
         #             out_channels*2,

@@ -92,6 +92,9 @@ class SemanticKitti(Dataset):
         self.max_points = max_points
         self.gt = gt
         self.transform = transform
+        self.upsample_classes = {5, 8, 12}  # your rare labels
+        self.upsample_factor = 3
+
 
         """
         Added stuff for dynamic object segmentation
