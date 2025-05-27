@@ -46,8 +46,7 @@ RUN pip install matplotlib
 RUN pip install schedulefree
 RUN pip install -U catalyst
 
-COPY train.py .
-COPY SAM2UNet.py .
+COPY . /workspace
 # Default command
 CMD ["bash"]
 

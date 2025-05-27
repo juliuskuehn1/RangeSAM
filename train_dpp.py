@@ -179,7 +179,7 @@ def new_boundary_loss(logits, mask, theta0=3):
 # 4) Combined loss
 # -----------------------------------------------------------------------------
 def combined_loss(logits, mask, num_classes=20,
-                  w_ce=1.5, w_lovasz=1.5, w_boundary=1):
+                  w_ce=1, w_lovasz=1.5, w_boundary=1):
     """
     A mix of four losses:
       - standard cross-entropy
@@ -187,33 +187,33 @@ def combined_loss(logits, mask, num_classes=20,
       - Lovasz-Softmax
       - boundary-sensitive
     """
-    freqs = torch.tensor([
-    0.03150183342534689,  # 0: unlabeled (void)
-    0.04260782867450238,  # 1: car
-    0.00016609538710765,  # 2: bicycle
-    0.00039838616015114,  # 3: motorcycle
-    0.00216493982413381,  # 4: truck
-    0.00180705529788636,  # 5: other-vehicle
-    0.00033758327431050,  # 6: person
-    0.00012711105887399,  # 7: bicyclist
-    0.00003746106399997,  # 8: motorcyclist
-    0.19879647126983287,  # 9: road
-    0.01471716954988821,  # 10: parking
-    0.14392298360372000,  # 11: sidewalk
-    0.00390485530374720,  # 12: other-ground
-    0.13268619447774860,  # 13: building
-    0.07235922294562230,  # 14: fence
-    0.26681502148037506,  # 15: vegetation
-    0.00603501201262603,  # 16: trunk
-    0.07814222006271769,  # 17: terrain
-    0.00285549819386317,  # 18: pole
-    0.00061559580861899,  # 19: traffic-sign
-    ], dtype=torch.float32, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-    eps    = 1e-6
-    median = freqs[1:].median()
-    p = 1.5    
-    w_c    = median / (freqs + eps)       # up‐weight rare classes
-    w_c[0] = 0.0                         # ignore void
+    # freqs = torch.tensor([
+    # 0.03150183342534689,  # 0: unlabeled (void)
+    # 0.04260782867450238,  # 1: car
+    # 0.00016609538710765,  # 2: bicycle
+    # 0.00039838616015114,  # 3: motorcycle
+    # 0.00216493982413381,  # 4: truck
+    # 0.00180705529788636,  # 5: other-vehicle
+    # 0.00033758327431050,  # 6: person
+    # 0.00012711105887399,  # 7: bicyclist
+    # 0.00003746106399997,  # 8: motorcyclist
+    # 0.19879647126983287,  # 9: road
+    # 0.01471716954988821,  # 10: parking
+    # 0.14392298360372000,  # 11: sidewalk
+    # 0.00390485530374720,  # 12: other-ground
+    # 0.13268619447774860,  # 13: building
+    # 0.07235922294562230,  # 14: fence
+    # 0.26681502148037506,  # 15: vegetation
+    # 0.00603501201262603,  # 16: trunk
+    # 0.07814222006271769,  # 17: terrain
+    # 0.00285549819386317,  # 18: pole
+    # 0.00061559580861899,  # 19: traffic-sign
+    # ], dtype=torch.float32, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+    # eps    = 1e-4
+    # median = freqs[1:].median()
+    # p = 1.5    
+    # w_c    = median / (freqs + eps)       # up‐weight rare classes
+    # w_c[0] = 0.0                         # ignore void
     # w_c = w_c * (len(w_c) / w_c.sum())
     # 1) CE (ignore void)
     # ce = focal_cross_entropy(
@@ -223,10 +223,32 @@ def combined_loss(logits, mask, num_classes=20,
     #             alpha=w_c,         # ← your class weights here
     #             ignore_index=0
     #         )
+    w_c = torch.tensor([
+    30.767496,   # 0: unlabeled
+    22.931664,   # 1: car
+   857.562744,   # 2: bicycle
+   715.110046,   # 3: motorcycle
+   315.961761,   # 4: truck
+   356.245178,   # 5: other-vehicle
+   747.617004,   # 6: person
+   887.223938,   # 7: bicyclist
+   963.891541,   # 8: motorcyclist
+     5.005093,   # 9: road
+    63.624687,   # 10: parking
+     6.900217,   # 11: sidewalk
+   203.879608,   # 12: other-ground
+     7.480204,   # 13: building
+    13.631550,   # 14: fence
+     3.733921,   # 15: vegetation
+   142.146164,   # 16: trunk
+    12.635481,   # 17: terrain
+   259.369873,   # 18: pole
+   618.966736    # 19: traffic-sign
+    ], dtype=torch.float32, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
     ce = F.cross_entropy(logits, mask,
                          weight=w_c,
                          ignore_index=0,
-                         reduction='none')
+                         reduction='mean')
     # 3) Lovasz
     l  = lovasz_softmax(logits, mask, ignore_index=0)
     # 4) Boundary
@@ -468,12 +490,17 @@ def train(rank, args):
 
     for n, p in model.named_parameters():
         if not p.requires_grad:
-            continue                      # frozen → skip completely
-        # 1) if it's any of the pos-embeddings in the backbone, treat it as "other"
+            continue
+
+        # 1) pos-embeddings of the backbone → other_params
         if "encoder.backbone" in n and "pos_embed" in n:
             other_params.append(p)
-        if "encoder.backbone" in n:       # <- matches the SAM2 trunk you kept
-            backbone_params.append(p)     #    (adapt the string if you renamed)
+
+        # 2) remaining backbone weights → backbone_params
+        elif "encoder.backbone" in n:
+            backbone_params.append(p)
+
+        # 3) everything else → other_params
         else:
             other_params.append(p)
 
@@ -482,7 +509,7 @@ def train(rank, args):
     optimizer = optim.AdamW(
     [
         {"params": other_params,    "lr": args.lr},   # heads, adapters, decoder
-        {"params": backbone_params, "lr": args.lr / 10},   # fine‑tune SAM2 trunk
+        {"params": backbone_params, "lr": args.backbone_lr},   # fine‑tune SAM2 trunk
     ],
         weight_decay=args.weight_decay,
     )
@@ -521,7 +548,7 @@ def train(rank, args):
             target = proj_labels.to(device, non_blocking=True).long()
             optimizer.zero_grad()
             out_main, out_aux= model(x)
-            weights = [1.0, 1.0, 0.5, 0.25]
+            weights = [1.0, 1.0, 1.0, 1.0]
             loss = combined_loss(out_main, target)  + sum(w * combined_loss(aux_pred, target) for w, aux_pred in zip(weights, out_aux))
             loss.backward()
             optimizer.step()
@@ -582,6 +609,8 @@ if __name__ == "__main__":
                         help="initial LR = base_lr × start_factor during warm-up")
     parser.add_argument("--min_lr",              type=float, default=1e-6,
                         help="η_min for cosine annealing phase")
+    parser.add_argument("--backbone_lr",              type=float, default=0.001,
+                        help="lr for backbone")
     ##########
     args = parser.parse_args()
     print("Parsed Arguments:")

@@ -158,21 +158,12 @@ class RSAMRFEncoder(nn.Module):
         msca_blocks = []
         for dim in [out_channels, out_channels*2, out_channels*4, out_channels*8]:
             msca_blocks.append(SpatialAttention(dim))
-        # blocks = []
-        # for block in self.backbone.blocks:
-        #     blocks.append(
-        #         ImprovedAdapter(block)
-        #     )
-        # self.backbone.blocks = nn.Sequential(
-        #     *blocks
-        # )
         adapted_blocks = nn.ModuleList()
         for i, blk in enumerate(self.backbone.blocks):
             stage_id   = stage_id_for_block(i)
             num_convs  = NUM_CONVS_PER_STAGE[stage_id]
             adapted_blocks.append(ImprovedAdapterSep(blk, num_convs))
             
-        # swap out the original blocks list
         self.backbone.blocks = adapted_blocks
         self.msca_blocks = nn.ModuleList(msca_blocks)
         self.dropout = nn.Dropout2d(p=0.2)
@@ -216,11 +207,12 @@ class RSAMRFEncoder(nn.Module):
 
     def forward(self, x):
         x = self.stem(x)
+        outputs = []
+        # outputs.append(x)
         x = x.permute(0, 2, 3, 1)
         # x = x + self.backbone._get_pos_embed(x.shape[1:3])
         if (self.pos_emb):
             x = x + self.backbone._get_pos_embed(x.shape[1:3])
-        outputs = []
         stage_idx = 0
         for i, blk in enumerate(self.backbone.blocks):
             x = blk(x)
@@ -251,16 +243,10 @@ class RSAMDecoder(nn.Module):
             self.conv3 = nn.Conv2d(out_channels*4, unify_dim, kernel_size=1)
             self.conv4 = nn.Conv2d(out_channels*8, unify_dim, kernel_size=1)
         self.main_head = nn.Sequential(
-            nn.Conv2d(unify_dim * 4, unify_dim * 3, 1),
-            nn.GroupNorm(1, unify_dim * 3),
-            nn.GELU(),
-            nn.Conv2d(unify_dim * 3, unify_dim * 2, 1),
+            nn.Conv2d(unify_dim * 4, unify_dim * 2, 1),
             nn.GroupNorm(1, unify_dim * 2),
             nn.GELU(),
-            nn.Conv2d(unify_dim * 2, unify_dim * 1, 1),
-            nn.GroupNorm(1, unify_dim * 1),
-            nn.GELU(),
-            nn.Conv2d(unify_dim * 1, 20, 1)
+            nn.Conv2d(unify_dim * 2, 20, 1)
         )
         self.aux_heads = nn.ModuleList([
             nn.Conv2d(unify_dim, 20, 1) for _ in range(4)
@@ -281,6 +267,63 @@ class RSAMDecoder(nn.Module):
         x4 = F.interpolate(x4, size=(H, W), mode='bilinear', align_corners=False)
         pred_main = self.main_head(torch.cat([x1, x2, x3, x4], dim=1))
         pred_aux = [head(h) for head, h in zip(self.aux_heads, [x1, x2, x3, x4])]
+        return pred_main, pred_aux  
+    
+class RSegDecoder(nn.Module):
+    def __init__(self, out_channels, unify_dim=256, use_rfb=True) -> None:
+        super(RSegDecoder, self).__init__()
+        self.use_rfb = use_rfb
+        if self.use_rfb:
+            self.rfb =  RFB_modified(out_channels, unify_dim)
+            self.rfb1 = RFB_modified(out_channels, unify_dim)
+            self.rfb2 = RFB_modified(out_channels*2, unify_dim)
+            self.rfb3 = RFB_modified(out_channels*4, unify_dim)
+            self.rfb4 = RFB_modified(out_channels*8, unify_dim)
+        else:
+            self.conv1 = nn.Conv2d(out_channels, unify_dim, kernel_size=1)
+            self.conv2 = nn.Conv2d(out_channels*2, unify_dim, kernel_size=1)
+            self.conv3 = nn.Conv2d(out_channels*4, unify_dim, kernel_size=1)
+            self.conv4 = nn.Conv2d(out_channels*8, unify_dim, kernel_size=1)
+            
+        self.decoder1 = nn.Conv2d(unify_dim*2, unify_dim, kernel_size=3, padding=1)
+        self.decoder2 = nn.Conv2d(unify_dim*2, unify_dim, kernel_size=3, padding=1)
+        self.decoder3 = nn.Conv2d(unify_dim*2, unify_dim, kernel_size=3, padding=1)
+        self.decoder4 = nn.Conv2d(unify_dim*2, unify_dim, kernel_size=3, padding=1)
+        
+        self.main_head = nn.Sequential(
+            nn.Conv2d(unify_dim * 3, unify_dim * 2, 1),
+            nn.GroupNorm(1, unify_dim * 2),
+            nn.GELU(),
+            nn.Conv2d(unify_dim * 2, unify_dim * 1, 1),
+            nn.GroupNorm(1, unify_dim * 1),
+            nn.GELU(),
+            nn.Conv2d(unify_dim * 1, 20, 1)
+        )
+        self.aux_heads = nn.ModuleList([
+            nn.Conv2d(unify_dim, 20, 1) for _ in range(3)
+        ])
+
+    def forward(self, x):
+        x, x1, x2, x3, x4 = x
+        H = 64
+        W = 2048
+        x, x_1, x_2, x_3, x_4 = self.rfb(x), self.rfb1(x1), self.rfb2(x2), self.rfb3(x3), self.rfb4(x4)
+        res_1 = self.decoder1(torch.cat((x, x_1), dim=1))
+        res_2 = F.interpolate(
+            x_2, size=(H, W), mode='bilinear', align_corners=True)
+        res_2 = self.decoder2(torch.cat((res_1, res_2), dim=1))
+
+        res_3 = F.interpolate(
+            x_3, size=(H, W), mode='bilinear', align_corners=True)
+        res_3 = self.decoder3(torch.cat((res_2, res_3), dim=1))
+
+        res_4 = F.interpolate(
+            x_4, size=(H, W), mode='bilinear', align_corners=True)
+        res_4 = self.decoder4(torch.cat((res_3, res_4), dim=1))
+        res = [res_2, res_3, res_4]
+        out = torch.cat(res, dim=1)
+        pred_main = self.main_head(out)
+        pred_aux = [head(h) for head, h in zip(self.aux_heads, [res_2, res_3, res_4])]
         return pred_main, pred_aux  
     
 
