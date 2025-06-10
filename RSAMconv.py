@@ -46,7 +46,7 @@ class RSAMRFEncoder(nn.Module):
         adapted_blocks = nn.ModuleList()
         for block in self.backbone.blocks:
             adapted_blocks.append(
-                BestAdapter(block)
+                VeryBestAdapter(block)
             )
         self.backbone.blocks = adapted_blocks
         self.act = nn.GELU()

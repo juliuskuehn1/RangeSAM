@@ -192,53 +192,36 @@ def dice_loss(logits, mask, num_classes, ignore_index=0, smooth=1e-6):
 
 def generalized_dice_loss(logits,
                            mask,
-                           weights=None,      # 1-D tensor[C]
+                           weights=None,      # 1-D tensor [C]
                            ignore_index=0,
                            smooth=1e-6):
     """
-    Multi-class Generalised Dice Loss
-      Sudre et al., “Generalised Dice overlap …”, arXiv:1707.03237
-      https://arxiv.org/abs/1707.03237
-    Args
-    ----
-      logits   : [B, C, H, W]  raw scores
-      mask     : [B, H, W]     integer labels in [0 … C-1]
-      weights  : per-class weights (higher → stronger)
-        – If None, uses 1 / (freq²) from the current mini-batch.
-      ignore_index : label to ignore (Semantic-KITTI = 0)
+    Sudre et al., ‘Generalised Dice overlap…’ (2017)
     """
     B, C, H, W = logits.shape
     device = logits.device
 
-    # 1) One-hot GT (skip ignore_index)
-    valid = mask != ignore_index                # [B,H,W] bool
-    gt  = F.one_hot(mask.clamp(min=0), C)       # [B,H,W,C]
-    gt  = gt.permute(0, 3, 1, 2).float()        # [B,C,H,W]
-    gt  = gt * valid.unsqueeze(1)
+    # ----- one-hot ground truth, skip ignore -----
+    valid = mask != ignore_index
+    gt = F.one_hot(mask.clamp(min=0), C).permute(0,3,1,2).float() * valid.unsqueeze(1)
+    prob = F.softmax(logits, 1) * valid.unsqueeze(1)
 
-    # 2) Softmax preds
-    prob = F.softmax(logits, dim=1) * valid.unsqueeze(1)
-
-    # 3) Class weights
+    # ----- class weights -----
     if weights is None:
-        # effective-number style: 1 / freq²  (Sudre et al.) :contentReference[oaicite:0]{index=0}
-        freq = gt.sum((0, 2, 3)) + smooth
-        w = 1.0 / (freq * freq)
+        freq = gt.sum((0,2,3)) + smooth          # per-class voxel count
+        w = 1.0 / (freq * freq)                  # 1 / freq²
     else:
         w = weights.to(device).float()
-        # optional normalisation so the max-weight ≈ 1
-        w = w / w.max()
+    w = w / (w.max() + 1e-6)                     # optional normalisation
+    if ignore_index < C:
+        w[ignore_index] = 0                      # make sure ignore class is zero-weighted
 
-    # 4) Numerator & denominator
-    intersect = (w * (prob * gt).sum((0, 2, 3)))    # Σ w_c · 2 p g
-    union     = (w * (prob + gt).sum((0, 2, 3)))    # Σ w_c · (p+g)
+    # ----- numerator & denominator (scalars) -----
+    intersect = torch.sum(w * (prob * gt).sum((0,2,3)))     # scalar
+    union     = torch.sum(w * (prob + gt).sum((0,2,3)))     # scalar
 
     dice = (2 * intersect + smooth) / (union + smooth)
-    # drop background (=ignore_index) from mean
-    if ignore_index < C:
-        dice = torch.cat((dice[:ignore_index], dice[ignore_index+1:]))
-
-    return 1.0 - dice.mean()
+    return 1.0 - dice
 
 # -----------------------------------------------------------------------------
 # 4) Combined loss
@@ -284,7 +267,7 @@ def combined_loss(logits, mask, num_classes=20,
     l  = lovasz_softmax(logits, mask, ignore_index=0)
     # 4) Boundary
     b  = new_boundary_loss(logits, mask)
-    d = generalized_dice_loss(logits=logits, mask=mask, weights=w_c, ignore_index=0)
+    d = generalized_dice_loss(logits=logits, mask=mask, ignore_index=0)
 
     return w_ce*ce + w_lovasz*l + w_dice*d + w_boundary*b
 
@@ -610,8 +593,8 @@ def train(rank, args):
                     print("New best mIoU!")
                     ckpt = os.path.join(args.save_path, f'SAM2-UNet-epoch{epoch}-rank{rank}.pth')
                     mIoU = metrics['miou']
-                torch.save(model.module.state_dict(), ckpt)
-                print(f"[Saved Snapshot:] {ckpt}")
+                    torch.save(model.module.state_dict(), ckpt)
+                    print(f"[Saved Snapshot:] {ckpt}")
     cleanup_ddp()
 
 if __name__ == "__main__":

@@ -267,7 +267,6 @@ class SemanticKitti(Dataset):
                     if random.random() > 0.5:
                         rot = True
                     drop_points = random.uniform(0, 0.5)
-
             if self.gt:
                 scan = SemLaserScan(self.color_map,
                                     project=True,
@@ -372,6 +371,38 @@ class SemanticKitti(Dataset):
         path_split = path_norm.split(os.sep)
         path_seq = path_split[-3]
         path_name = path_split[-1].replace(".bin", ".label")
+        # if self.transform:
+        #     # 1) 360° Random Yaw (column roll) - Better than cutline
+        #     if random.random() < 0.5:  # 50% probability
+        #         shift = random.randint(0, self.sensor_img_W - 1)
+        #         proj_full = torch.roll(proj_full, shifts=shift, dims=2)    # C,H,W
+        #         proj_mask = torch.roll(proj_mask, shifts=shift, dims=1)    # H,W  
+        #         proj_labels = torch.roll(proj_labels, shifts=shift, dims=1) # H,W
+            
+        #     # 2) Laser-beam dropout (zero out complete scan lines)
+        #     if random.random() < 0.2:  # 20% probability
+        #         keep_prob = 0.95  # drop 5% of beams
+        #         drop_mask = torch.rand(self.sensor_img_H) > keep_prob
+        #         drop_mask = drop_mask.to(proj_full.device)
+        #         proj_full[:, drop_mask, :] = 0
+        #         proj_mask[drop_mask, :] = 0
+        #         proj_labels[drop_mask, :] = 0
+            
+        #     # 3) Horizontal flipping (keep your existing)
+        #     if random.random() < 0.5:
+        #         proj_full = torch.flip(proj_full, [-1])
+        #         proj_mask = torch.flip(proj_mask, [-1])
+        #         proj_labels = torch.flip(proj_labels, [-1])
+            
+        #     # 4) Gaussian noise on remission channel
+        #     if random.random() < 0.5:
+        #         # Find remission channel index (usually channel 4 in [range, x, y, z, remission] setup)
+        #         remission_idx = 4  # Verify this matches your channel order!
+        #         if proj_full.shape[0] > remission_idx:  # Safety check
+        #             sigma = 0.02
+        #             noise = torch.randn_like(proj_full[remission_idx]) * sigma
+        #             proj_full[remission_idx] = (proj_full[remission_idx] + noise).clamp_(0, 1)
+
         proj_full = proj_full * proj_mask.float()
         ### A simple version Cutline operation by JiadaiSun ###
         # if int(seq) in [0, 1, 2, 3, 4, 5, 6, 7, 9, 10]: # only for training sequences

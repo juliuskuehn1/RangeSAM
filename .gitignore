@@ -9,3 +9,5 @@ _C.*
 outputs/*
 checkpoints/*.pt
 demo/backend/checkpoints/*.pt
+cuda-repo-ubuntu2204-12-1-local_12.1.0-530.30.02-1_amd64.deb
+sam2.1_hiera_tiny.pt

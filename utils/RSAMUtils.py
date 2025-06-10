@@ -319,6 +319,35 @@ class BestAdapter(nn.Module):
         out = self.act(out)                     
         return out + x
 
+class VeryBestAdapter(nn.Module):
+    def __init__(self, blk):
+        super().__init__()
+        self.block = blk
+        dim = blk.dim_out          # = channel dim C
+        self.act = nn.GELU()
+        msca_blocks = []
+        self.msca_blocks = SpatialAttention(dim)
+        self.dropout = nn.Dropout2d(p=0.2)
+        self.conv1 = nn.Conv2d(dim*1, dim*1, 1)
+        self.conv2 = nn.Conv2d(dim, dim, 1)
+        self.norm1 =nn.LayerNorm(dim*1)
+        self.norm2 = nn.LayerNorm(dim*1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:       
+        feat = self.block(x)
+        feat = feat.permute(0, 3, 1, 2)
+        out = self.conv1(feat)
+        out = out.permute(0, 2, 3, 1)
+        out = self.norm1(out)
+        out = self.act(out)
+        out = out.permute(0, 3, 1, 2)
+        out = self.dropout(self.msca_blocks(out)) + out
+        feat = feat + out
+        feat = self.conv2(feat)
+        feat = feat.permute(0, 2, 3, 1)
+        feat = self.norm2(feat)
+        feat = self.act(feat)
+        return feat
+
 class DropoutAdapter(nn.Module):
     def __init__(self, blk):
         super().__init__()
