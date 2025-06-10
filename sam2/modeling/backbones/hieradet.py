@@ -184,10 +184,10 @@ class Hiera(nn.Module):
         window_pos_embed_bkg_spatial_size: Tuple[int, int] = (14, 14),
         # window size per stage, when not using global att.
         window_spec: Tuple[int, ...] = (
-            8,
             4,
-            14,
-            7,
+            4,
+            4,
+            4,
         ),
         # global attn in these blocks
         global_att_blocks: Tuple[int, ...] = (
@@ -202,7 +202,6 @@ class Hiera(nn.Module):
 
         assert len(stages) == len(window_spec)
         self.window_spec = window_spec
-        print("Value of window spec:", window_spec)
         depth = sum(stages)
         self.q_stride = q_stride
         self.stage_ends = [sum(stages[:i]) - 1 for i in range(1, len(stages) + 1)]
@@ -218,7 +217,6 @@ class Hiera(nn.Module):
 
         # Windowed positional embedding (https://arxiv.org/abs/2311.05613)
         self.window_pos_embed_bkg_spatial_size = window_pos_embed_bkg_spatial_size
-        print("Value of window pos embed spatial size:", window_pos_embed_bkg_spatial_size)
         self.pos_embed = nn.Parameter(
             torch.zeros(1, embed_dim, *self.window_pos_embed_bkg_spatial_size)
         )
@@ -284,21 +282,16 @@ class Hiera(nn.Module):
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         print("Original shape of x: ", x.shape)
         x = self.patch_embed(x)
-        # x: (B, H, W, C)
-        print("Shape of x after patch embed: ", x.shape)
         # Add pos embed
         x = x + self._get_pos_embed(x.shape[1:3])
-        print("Shape of x after pos embed: ", x.shape)
         outputs = []
         for i, blk in enumerate(self.blocks):
             x = blk(x)
-            print("Shape of x after block ", i, ": ", x.shape)
             if (i == self.stage_ends[-1]) or (
                 i in self.stage_ends and self.return_interm_layers
             ):
                 feats = x.permute(0, 3, 1, 2)
                 outputs.append(feats)
-                print("Shape of feats after block ", i, ": ", feats.shape)
 
         return outputs
 

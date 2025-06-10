@@ -14,7 +14,7 @@ from torch.cuda.amp import autocast, GradScaler
 import torch.distributed as dist
 import torch.multiprocessing as mp
 #from kitti_dataloader import MultiSeqNpZDataset, Seq02NpZDataset
-from RSAMconv import SAM2UNet
+from RSAMComb import ResNet_34 
 from preprocess.parser import Parser, SemanticKitti
 from utils.utils import *
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
@@ -175,76 +175,11 @@ def new_boundary_loss(logits, mask, theta0=3):
 
     return loss.mean()
 
-###########
-# Dice loss
-###########
-
-def dice_loss(logits, mask, num_classes, ignore_index=0, smooth=1e-6):
-    probs = F.softmax(logits, 1)
-    gt    = F.one_hot(mask.clamp(min=0), num_classes).permute(0, 3, 1, 2).float()
-    valid = (mask != ignore_index).unsqueeze(1).float()
-    probs, gt = probs * valid, gt * valid
-    inter = (probs * gt).sum((0, 2, 3))
-    union = probs.sum((0, 2, 3)) + gt.sum((0, 2, 3))
-    dice  = (2 * inter + smooth) / (union + smooth)
-    dice  = dice[1:]
-    return 1. - dice.mean()
-
-def generalized_dice_loss(logits,
-                           mask,
-                           weights=None,      # 1-D tensor[C]
-                           ignore_index=0,
-                           smooth=1e-6):
-    """
-    Multi-class Generalised Dice Loss
-      Sudre et al., “Generalised Dice overlap …”, arXiv:1707.03237
-      https://arxiv.org/abs/1707.03237
-    Args
-    ----
-      logits   : [B, C, H, W]  raw scores
-      mask     : [B, H, W]     integer labels in [0 … C-1]
-      weights  : per-class weights (higher → stronger)
-        – If None, uses 1 / (freq²) from the current mini-batch.
-      ignore_index : label to ignore (Semantic-KITTI = 0)
-    """
-    B, C, H, W = logits.shape
-    device = logits.device
-
-    # 1) One-hot GT (skip ignore_index)
-    valid = mask != ignore_index                # [B,H,W] bool
-    gt  = F.one_hot(mask.clamp(min=0), C)       # [B,H,W,C]
-    gt  = gt.permute(0, 3, 1, 2).float()        # [B,C,H,W]
-    gt  = gt * valid.unsqueeze(1)
-
-    # 2) Softmax preds
-    prob = F.softmax(logits, dim=1) * valid.unsqueeze(1)
-
-    # 3) Class weights
-    if weights is None:
-        # effective-number style: 1 / freq²  (Sudre et al.) :contentReference[oaicite:0]{index=0}
-        freq = gt.sum((0, 2, 3)) + smooth
-        w = 1.0 / (freq * freq)
-    else:
-        w = weights.to(device).float()
-        # optional normalisation so the max-weight ≈ 1
-        w = w / w.max()
-
-    # 4) Numerator & denominator
-    intersect = (w * (prob * gt).sum((0, 2, 3)))    # Σ w_c · 2 p g
-    union     = (w * (prob + gt).sum((0, 2, 3)))    # Σ w_c · (p+g)
-
-    dice = (2 * intersect + smooth) / (union + smooth)
-    # drop background (=ignore_index) from mean
-    if ignore_index < C:
-        dice = torch.cat((dice[:ignore_index], dice[ignore_index+1:]))
-
-    return 1.0 - dice.mean()
-
 # -----------------------------------------------------------------------------
 # 4) Combined loss
 # -----------------------------------------------------------------------------
 def combined_loss(logits, mask, num_classes=20,
-                  w_ce=1, w_lovasz=1, w_dice=1, w_boundary=1):
+                  w_ce=1, w_lovasz=1.5, w_boundary=1):
     """
     A mix of four losses:
       - standard cross-entropy
@@ -252,6 +187,42 @@ def combined_loss(logits, mask, num_classes=20,
       - Lovasz-Softmax
       - boundary-sensitive
     """
+    # freqs = torch.tensor([
+    # 0.03150183342534689,  # 0: unlabeled (void)
+    # 0.04260782867450238,  # 1: car
+    # 0.00016609538710765,  # 2: bicycle
+    # 0.00039838616015114,  # 3: motorcycle
+    # 0.00216493982413381,  # 4: truck
+    # 0.00180705529788636,  # 5: other-vehicle
+    # 0.00033758327431050,  # 6: person
+    # 0.00012711105887399,  # 7: bicyclist
+    # 0.00003746106399997,  # 8: motorcyclist
+    # 0.19879647126983287,  # 9: road
+    # 0.01471716954988821,  # 10: parking
+    # 0.14392298360372000,  # 11: sidewalk
+    # 0.00390485530374720,  # 12: other-ground
+    # 0.13268619447774860,  # 13: building
+    # 0.07235922294562230,  # 14: fence
+    # 0.26681502148037506,  # 15: vegetation
+    # 0.00603501201262603,  # 16: trunk
+    # 0.07814222006271769,  # 17: terrain
+    # 0.00285549819386317,  # 18: pole
+    # 0.00061559580861899,  # 19: traffic-sign
+    # ], dtype=torch.float32, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+    # eps    = 1e-4
+    # median = freqs[1:].median()
+    # p = 1.5    
+    # w_c    = median / (freqs + eps)       # up‐weight rare classes
+    # w_c[0] = 0.0                         # ignore void
+    # w_c = w_c * (len(w_c) / w_c.sum())
+    # 1) CE (ignore void)
+    # ce = focal_cross_entropy(
+    #             logits,
+    #             mask,
+    #             gamma=2.0,
+    #             alpha=w_c,         # ← your class weights here
+    #             ignore_index=0
+    #         )
     w_c = torch.tensor([
     30.767496,   # 0: unlabeled
     22.931664,   # 1: car
@@ -274,7 +245,6 @@ def combined_loss(logits, mask, num_classes=20,
    259.369873,   # 18: pole
    618.966736    # 19: traffic-sign
     ], dtype=torch.float32, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-    w_c = w_c/w_c.mean()
     w_c = w_c.to(logits.dtype)
     ce = F.cross_entropy(logits, mask,
                          weight=w_c,
@@ -284,9 +254,8 @@ def combined_loss(logits, mask, num_classes=20,
     l  = lovasz_softmax(logits, mask, ignore_index=0)
     # 4) Boundary
     b  = new_boundary_loss(logits, mask)
-    d = generalized_dice_loss(logits=logits, mask=mask, weights=w_c, ignore_index=0)
 
-    return w_ce*ce + w_lovasz*l + w_dice*d + w_boundary*b
+    return w_ce*ce + w_lovasz*l + w_boundary*b
 
 
 def evaluate_metrics(model, dataloader, num_classes=20,
@@ -501,22 +470,12 @@ def train(rank, args):
     seed_torch(1904 + rank)
     train_loader, val_loader, train_sampler, val_sampler = initiate_parser(rank, args.world_size, args.batch_size)
     device = torch.device(f"cuda:{rank}")
-    model = SAM2UNet(
-        "sam2.1_hiera_t.yaml",
-        "sam2.1_hiera_tiny.pt",
-        stem=args.stem,
-        freeze_weight=args.freeze_weight,
-        adapter=args.adapter,
-        msca=args.msca,
-        unify_dim=args.unify_dim,   # e.g. 256
-        use_rfb=args.use_rfb,        # True / False
-        pos_emb=args.pos_emb,
-    ).to(device)
+    model = ResNet_34().to(device)
     model = torch.nn.parallel.DistributedDataParallel(
         model,
         device_ids=[rank]
     )
-    model = torch.compile(model)
+    # model = torch.compile(model)
     backbone_params = []
     other_params    = []
     
@@ -570,7 +529,6 @@ def train(rank, args):
     )
     mIoU = 0
     os.makedirs(args.save_path, exist_ok=True)
-    weights = [1.0, 1.0, 1.0, 1.0]
     for epoch in range(1, args.epochs + 1):
         model.train()
         # optimizer.train()
@@ -582,6 +540,7 @@ def train(rank, args):
             target = proj_labels.to(device, non_blocking=True).long()
             optimizer.zero_grad()
             out_main, out_aux= model(x)
+            weights = [1.0, 1.0, 0.5, 0.25]
             loss = combined_loss(out_main, target)  + sum(w * combined_loss(aux_pred, target) for w, aux_pred in zip(weights, out_aux))
             loss.backward()
             optimizer.step()

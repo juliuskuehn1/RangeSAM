@@ -3,6 +3,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sam2.build_sam import build_sam2
 
+def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=dilation, groups=groups, bias=False, dilation=dilation)
+
+
+def conv1x1(in_planes, out_planes, stride=1):
+    """1x1 convolution"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
+
 
 class AttentionModule(nn.Module):
     def __init__(self, dim):
@@ -43,7 +54,7 @@ class SpatialAttention(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.proj_1 = nn.Conv2d(dim, dim, 1)
-        self.act = nn.LeakyReLU()
+        self.act = nn.GELU()
         self.spatial_gating_unit = AttentionModule(dim)
         self.proj_2 = nn.Conv2d(dim, dim, 1)
 
@@ -67,6 +78,37 @@ class IAC(nn.Module):
                            align_corners=True)
         fused = torch.cat((prev, up), dim=1)
         return self.conv(fused)
+    
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
+                 base_width=64, dilation=1, if_BN=None):
+        super(BasicBlock, self).__init__()
+        if groups != 1 or base_width != 64:
+            raise ValueError(
+                'BasicBlock only supports groups=1 and base_width=64')
+        if dilation > 1:
+            raise NotImplementedError(
+                "Dilation > 1 not supported in BasicBlock")
+
+        self.downsample = downsample
+
+        self.conv = BasicConv2d(planes, planes, 3, padding=1)
+
+        self.attn = SpatialAttention(planes)
+        self.dropout = nn.Dropout2d(p=0.2)
+
+    def forward(self, x):
+        if self.downsample is not None:
+            x = self.downsample(x)
+
+        out = self.conv(x)
+        out = out + self.dropout(self.attn(out))
+
+        out += x
+
+        return out
 
 
 # --------------------------------
@@ -105,6 +147,8 @@ class DoubleConv(nn.Module):
 
     def forward(self, x):
         return self.double_conv(x)
+    
+    
 
 
 class Up(nn.Module):
@@ -133,9 +177,9 @@ class Adapter(nn.Module):
         self.block = blk
         dim = blk.attn.qkv.in_features
         self.prompt_learn = nn.Sequential(
-            nn.Linear(dim, 32),
+            nn.Linear(dim, dim*4),
             nn.GELU(),
-            nn.Linear(32, dim),
+            nn.Linear(dim*4, dim),
             nn.GELU()
         )
 
@@ -161,6 +205,14 @@ def stage_id_for_block(idx: int) -> int:
 # mapping stage-id ➜ number of 3×3 convolutions
 NUM_CONVS_PER_STAGE = {0: 0, 1: 1, 2: 2, 3: 3}
 
+class Permute(nn.Module):
+    def __init__(self, *dims):
+        super().__init__()
+        self.dims = dims
+
+    def forward(self, x):
+        return x.permute(*self.dims)
+
 class ImprovedAdapterSep(nn.Module):
     """
     Same idea, but each 3×3 depth-wise conv is factorised
@@ -170,45 +222,104 @@ class ImprovedAdapterSep(nn.Module):
         super().__init__()
         self.block = blk
         self.dim   = blk.attn.qkv.in_features
-
         self.linear1 = nn.Linear(self.dim, self.dim * 4)
         self.linear2 = nn.Linear(self.dim * 4, self.dim)
+        self.norm1 = nn.LayerNorm(self.dim*4)
+        self.norm2 = nn.LayerNorm(self.dim)
         self.act     = nn.GELU()
 
         convs = []
         if (num_convs == 0):
             convs.extend([
                 nn.Conv2d(self.dim * 4, self.dim * 4, kernel_size=1, groups=self.dim, bias=True),
+                Permute(0, 2, 3, 1),
+                nn.LayerNorm(self.dim * 4),
                 nn.GELU(),
+                Permute(0, 3, 1, 2)
             ])
         for _ in range(num_convs):
             convs.extend([
                 nn.Conv2d(self.dim * 4, self.dim * 4,
-                          kernel_size=(1, 3), padding=(0, 1),
+                          kernel_size=3, padding=1,
                           groups=self.dim, bias=True),
+                Permute(0, 2, 3, 1),
+                nn.LayerNorm(self.dim * 4),
                 nn.GELU(),
-                nn.Conv2d(self.dim * 4, self.dim * 4,
-                          kernel_size=(3, 1), padding=(1, 0),
-                          groups=self.dim, bias=True),
-                nn.GELU(),
+                Permute(0, 3, 1, 2)
             ])
         self.dw_stack = nn.Sequential(*convs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.act(self.linear1(x))
+        y = self.linear1(x)
+        y = self.norm1(y)
+        y = self.act(y)
         y = y.permute(0, 3, 1, 2)
         y = self.dw_stack(y)
         y = y.permute(0, 2, 3, 1)
-        y = self.act(self.linear2(y))
+        y = self.linear2(y)
+        y = self.norm2(y)
+        y = self.act(y)
         out = self.block(x + y)
         return out
 
 class ImprovedAdapter(nn.Module):
-    """
-    SegFormer-style Adapter that can sit in front of a MultiScaleBlock.
-    Works for any spatial resolution because H and W are taken
-    from the input on every forward pass.
-    """
+    def __init__(self, blk):
+        super().__init__()
+        self.block = blk
+        dim = blk.attn.qkv.in_features          # = channel dim C
+
+        self.linear1 = nn.Linear(dim, dim*4)
+        self.norm1 = nn.LayerNorm(dim*4)
+        self.norm2 = nn.LayerNorm(dim*4)
+        self.norm3 = nn.LayerNorm(dim)
+        self.dwconv  = nn.Conv2d(
+            dim*4, dim*4,
+            kernel_size=3, padding=1, groups=dim, bias=True
+        )
+        self.linear2 = nn.Linear(dim*4, dim)
+        # self.conv2 = nn.Conv2d(dim*4, dim, kernel_size=1)
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.linear1(x)                     # (B, H, W, C)
+        y = self.norm1(y)
+        y = self.act(y)
+        y = y.permute(0, 3, 1, 2)               # (B, C, H, W)
+        #y = self.conv1(y)
+        y = self.dwconv(y)                      # (B, C, H, W)
+        y = y.permute(0, 2, 3, 1)
+        y = self.norm2(y)
+        y = self.act(y)
+        #y = self.conv2(y)
+        y = self.linear2(y)
+        y = self.norm3(y)
+        y = self.act(y)
+        x = x + y                               
+        out = self.block(x)                     
+        return out
+
+class BestAdapter(nn.Module):
+    def __init__(self, blk):
+        super().__init__()
+        self.block = blk
+        dim = blk.dim_out          # = channel dim C
+        self.dwconv  = nn.Conv2d(
+            dim, dim,
+            kernel_size=3, padding=1, groups=dim, bias=True
+        )
+        self.norm = nn.LayerNorm(dim)
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:       
+        x = self.block(x)
+        out = x.permute(0, 3, 1, 2)
+        out = self.dwconv(out)
+        out = out.permute(0, 2, 3, 1)
+        out = self.norm(out)
+        out = self.act(out)                     
+        return out + x
+
+class DropoutAdapter(nn.Module):
     def __init__(self, blk):
         super().__init__()
         self.block = blk
@@ -218,11 +329,11 @@ class ImprovedAdapter(nn.Module):
         # self.conv1 = nn.Conv2d(dim, dim*4, kernel_size=1)
         self.dwconv  = nn.Conv2d(
             dim*4, dim*4,
-            kernel_size=3, padding=1, groups=dim, bias=True
-        )
+            kernel_size=3, padding=1, groups=dim)
         self.linear2 = nn.Linear(dim*4, dim)
         # self.conv2 = nn.Conv2d(dim*4, dim, kernel_size=1)
         self.act = nn.GELU()
+        self.dropout = nn.Dropout2d(p=0.05)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.linear1(x)                     # (B, H, W, C)
@@ -235,23 +346,26 @@ class ImprovedAdapter(nn.Module):
         y = y.permute(0, 2, 3, 1)               # (B, H, W, C)
         y = self.linear2(y)
         y = self.act(y)
-        x = x + y                               
+        x = x + y            
         out = self.block(x)                     
         return out
 
-
 class BasicConv2d(nn.Module):
-    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1):
+    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, gelu=False):
         super(BasicConv2d, self).__init__()
         self.conv = nn.Conv2d(in_planes, out_planes,
                               kernel_size=kernel_size, stride=stride,
                               padding=padding, dilation=dilation, bias=False)
-        self.bn = nn.BatchNorm2d(out_planes)
-        self.relu = nn.ReLU(inplace=True)
+        self.ln = nn.LayerNorm(out_planes)
+        self.act = nn.GELU()
+        self.gelu = gelu
 
     def forward(self, x):
         x = self.conv(x)
-        x = self.bn(x)
+        x = x.permute(0, 2, 3, 1)
+        x = self.ln(x)
+        x = self.act(x)
+        x = x.permute(0, 3, 1, 2)
         return x
 
 

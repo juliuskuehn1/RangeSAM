@@ -9,7 +9,7 @@ import torch
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from torch.optim.lr_scheduler import OneCycleLR
 from torch.cuda.amp import autocast, GradScaler
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -20,70 +20,55 @@ from utils.utils import *
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 from schedulefree import AdamWScheduleFree
 
-torch.set_float32_matmul_precision('high')
 
-def class_balanced_mean(loss, mask, ignore_index=0, num_classes=None):
-    """
-    loss:       torch.Tensor of shape [B,H,W], no reduction yet
-    mask:       torch.LongTensor of shape [B,H,W]
-    ignore_index:  label to ignore
-    num_classes:   total # of classes C  (including ignore)
-    """
-    if num_classes is None:
-        num_classes = int(mask.max()) + 1
+def soft_iou_loss(logits, mask, num_classes, smooth=1e-6, ignore_index=0):
+    probs = F.softmax(logits, dim=1)
+    with torch.no_grad():
+        gt = torch.eye(num_classes, device=mask.device)[mask]
+        gt = gt.permute(0,3,1,2).float()
+    valid = (mask != ignore_index).unsqueeze(1).float()
+    probs = probs * valid
+    gt    = gt    * valid
+    dims = (0,2,3)
+    intersection = probs.mul(gt).sum(dim=dims)
+    total        = probs.add(gt).sum(dim=dims)
+    union        = total - intersection
+    iou = (intersection + smooth) / (union + smooth)
+    iou = torch.cat([iou[:ignore_index], iou[ignore_index+1:]], dim=0)
+    return 1.0 - iou.mean()
 
-    # 1) flatten and mask
-    valid = (mask != ignore_index)
-    loss_flat = loss[valid]                # [N_valid]
-    mask_flat = mask[valid]                # [N_valid]
 
-    # 2) compute per-class sums and counts
-    C = num_classes
-    device = loss.device
-    sum_per_class   = torch.zeros(C, device=device)
-    count_per_class = torch.zeros(C, device=device)
-
-    sum_per_class   = sum_per_class.scatter_add(0, mask_flat, loss_flat)
-    count_per_class = count_per_class.scatter_add(0, mask_flat, torch.ones_like(loss_flat))
-
-    # 3) for each class present, compute its mean
-    present = count_per_class > 0
-    mean_per_class = sum_per_class[present] / count_per_class[present]
-
-    # 4) average the class-means
-    if mean_per_class.numel() == 0:
-        return torch.tensor(0.0, device=device)
-    return mean_per_class.mean()
+def structure_loss(logits, mask, num_classes=20,
+                   weight_ce=0.3, weight_iou=0.7):
+    ce = F.cross_entropy(logits, mask,
+                         ignore_index=0,
+                         reduction='mean')
+    iou = soft_iou_loss(logits, mask, num_classes,
+                        ignore_index=0)
+    return weight_ce * ce + weight_iou * iou
 
 # -----------------------------------------------------------------------------
 # 1) Dice loss (soft, averaged over classes 1…C-1)
 # -----------------------------------------------------------------------------
-def focal_cross_entropy(logits, mask, gamma=2.0, alpha=None, ignore_index=0, reduction='mean'):
-    """
-    Focal loss with optional per-class α weighting.
-      logits:     [B, C, H, W]
-      mask:       [B, H, W] integer labels in [0..C-1]
-      gamma:      focusing parameter
-      alpha:      tensor[C] of class weights, or None
-    """
-    # 1) standard per-pixel CE
-    ce = F.cross_entropy(logits, mask,
-                         ignore_index=ignore_index,
-                         reduction='none')           # [B,H,W]
-    p_t = torch.exp(-ce)                       # [B,H,W] prob of true class
+def dice_loss(logits, mask, num_classes, ignore_index=0, smooth=1e-6):
+    probs = F.softmax(logits, dim=1)                              # [B,C,H,W]
+    # one-hot GT
+    gt = F.one_hot(mask.clamp(min=0), num_classes)                # [B,H,W,C]
+    gt = gt.permute(0,3,1,2).float()                              # [B,C,H,W]
+    # mask out ignore_index
+    valid = (mask != ignore_index).unsqueeze(1).float()           # [B,1,H,W]
+    probs = probs * valid
+    gt    = gt    * valid
 
-    # 2) focal scaling
-    loss = (1 - p_t)**gamma * ce               # [B,H,W]
+    # per-class intersection & union
+    dims = (0,2,3)
+    inter = (probs * gt).sum(dims)                                # [C]
+    union = probs.sum(dims) + gt.sum(dims)                        # [C]
+    dice  = (2*inter + smooth) / (union + smooth)                 # [C]
 
-    # 3) α weighting
-    if alpha is not None:
-        # mask.clamp to avoid indexing -1 for ignore_index
-        idx = mask.clamp(min=0)        # still [B,H,W]
-        a   = alpha[idx]               # now [B,H,W]
-        loss = a * loss
-        
-    return class_balanced_mean(loss, mask, ignore_index=0, num_classes=20)
-
+    # drop the void class
+    dice = dice[1:]
+    return 1.0 - dice.mean()
 
 
 # -----------------------------------------------------------------------------
@@ -134,6 +119,43 @@ def lovasz_softmax(logits, mask, ignore_index=0):
 # -----------------------------------------------------------------------------
 # 3) Boundary loss (penalize mistakes near class edges)
 # -----------------------------------------------------------------------------
+def boundary_loss(logits, mask, num_classes, ignore_index=0):
+    # compute a simple boundary map from GT via Sobel filters
+    with torch.no_grad():
+        gt = F.one_hot(mask.clamp(min=0), num_classes)            # [B,H,W,C]
+        gt = gt.permute(0,3,1,2).float()                           # [B,C,H,W]
+        # only consider real classes
+        gt = gt[:,1:,:,:]
+        # Sobel kernels
+        kx = torch.tensor(
+            [[1.0, 0.0, -1.0],
+             [2.0, 0.0, -2.0],
+             [1.0, 0.0, -1.0]],
+            dtype=torch.float32,
+            device=gt.device
+        ).view(1, 1, 3, 3)
+
+        ky = kx.transpose(2, 3)  # still float, same device
+        edges = []
+        for c in range(gt.size(1)):
+            g = gt[:,c:c+1]
+            ex = F.conv2d(g, kx, padding=1)
+            ey = F.conv2d(g, ky, padding=1)
+            edges.append(torch.sqrt(ex**2 + ey**2))
+        boundary_map = torch.clamp(torch.cat(edges,1), 0, 1)       # [B,C-1,H,W]
+        # collapse to a single-channel weight
+        boundary_map = boundary_map.max(dim=1, keepdim=True)[0]   # [B,1,H,W]
+
+    probs = F.softmax(logits, dim=1)                              # [B,C,H,W]
+    one_hot = F.one_hot(mask.clamp(min=0), num_classes)           # [B,H,W,C]
+    one_hot = one_hot.permute(0,3,1,2).float()                    # [B,C,H,W]
+    valid = (mask != ignore_index).unsqueeze(1).float()           # [B,1,H,W]
+
+    diff = (probs - one_hot).abs() * valid                        # [B,C,H,W]
+    # weight only boundary pixels
+    b_loss = (diff * boundary_map).sum() / (boundary_map.sum() + 1e-6)
+    return b_loss
+
 def new_boundary_loss(logits, mask, theta0=3):
     """
     Compute the boundary F1 loss between prediction and ground-truth,
@@ -175,76 +197,12 @@ def new_boundary_loss(logits, mask, theta0=3):
 
     return loss.mean()
 
-###########
-# Dice loss
-###########
-
-def dice_loss(logits, mask, num_classes, ignore_index=0, smooth=1e-6):
-    probs = F.softmax(logits, 1)
-    gt    = F.one_hot(mask.clamp(min=0), num_classes).permute(0, 3, 1, 2).float()
-    valid = (mask != ignore_index).unsqueeze(1).float()
-    probs, gt = probs * valid, gt * valid
-    inter = (probs * gt).sum((0, 2, 3))
-    union = probs.sum((0, 2, 3)) + gt.sum((0, 2, 3))
-    dice  = (2 * inter + smooth) / (union + smooth)
-    dice  = dice[1:]
-    return 1. - dice.mean()
-
-def generalized_dice_loss(logits,
-                           mask,
-                           weights=None,      # 1-D tensor[C]
-                           ignore_index=0,
-                           smooth=1e-6):
-    """
-    Multi-class Generalised Dice Loss
-      Sudre et al., “Generalised Dice overlap …”, arXiv:1707.03237
-      https://arxiv.org/abs/1707.03237
-    Args
-    ----
-      logits   : [B, C, H, W]  raw scores
-      mask     : [B, H, W]     integer labels in [0 … C-1]
-      weights  : per-class weights (higher → stronger)
-        – If None, uses 1 / (freq²) from the current mini-batch.
-      ignore_index : label to ignore (Semantic-KITTI = 0)
-    """
-    B, C, H, W = logits.shape
-    device = logits.device
-
-    # 1) One-hot GT (skip ignore_index)
-    valid = mask != ignore_index                # [B,H,W] bool
-    gt  = F.one_hot(mask.clamp(min=0), C)       # [B,H,W,C]
-    gt  = gt.permute(0, 3, 1, 2).float()        # [B,C,H,W]
-    gt  = gt * valid.unsqueeze(1)
-
-    # 2) Softmax preds
-    prob = F.softmax(logits, dim=1) * valid.unsqueeze(1)
-
-    # 3) Class weights
-    if weights is None:
-        # effective-number style: 1 / freq²  (Sudre et al.) :contentReference[oaicite:0]{index=0}
-        freq = gt.sum((0, 2, 3)) + smooth
-        w = 1.0 / (freq * freq)
-    else:
-        w = weights.to(device).float()
-        # optional normalisation so the max-weight ≈ 1
-        w = w / w.max()
-
-    # 4) Numerator & denominator
-    intersect = (w * (prob * gt).sum((0, 2, 3)))    # Σ w_c · 2 p g
-    union     = (w * (prob + gt).sum((0, 2, 3)))    # Σ w_c · (p+g)
-
-    dice = (2 * intersect + smooth) / (union + smooth)
-    # drop background (=ignore_index) from mean
-    if ignore_index < C:
-        dice = torch.cat((dice[:ignore_index], dice[ignore_index+1:]))
-
-    return 1.0 - dice.mean()
 
 # -----------------------------------------------------------------------------
 # 4) Combined loss
 # -----------------------------------------------------------------------------
 def combined_loss(logits, mask, num_classes=20,
-                  w_ce=1, w_lovasz=1, w_dice=1, w_boundary=1):
+                  w_ce=1.25, w_lovasz=1.5, w_boundary=1):
     """
     A mix of four losses:
       - standard cross-entropy
@@ -252,50 +210,53 @@ def combined_loss(logits, mask, num_classes=20,
       - Lovasz-Softmax
       - boundary-sensitive
     """
-    w_c = torch.tensor([
-    30.767496,   # 0: unlabeled
-    22.931664,   # 1: car
-   857.562744,   # 2: bicycle
-   715.110046,   # 3: motorcycle
-   315.961761,   # 4: truck
-   356.245178,   # 5: other-vehicle
-   747.617004,   # 6: person
-   887.223938,   # 7: bicyclist
-   963.891541,   # 8: motorcyclist
-     5.005093,   # 9: road
-    63.624687,   # 10: parking
-     6.900217,   # 11: sidewalk
-   203.879608,   # 12: other-ground
-     7.480204,   # 13: building
-    13.631550,   # 14: fence
-     3.733921,   # 15: vegetation
-   142.146164,   # 16: trunk
-    12.635481,   # 17: terrain
-   259.369873,   # 18: pole
-   618.966736    # 19: traffic-sign
+    freqs = torch.tensor([
+    0.03150183342534689,  # 0: unlabeled (void)
+    0.04260782867450238,  # 1: car
+    0.00016609538710765,  # 2: bicycle
+    0.00039838616015114,  # 3: motorcycle
+    0.00216493982413381,  # 4: truck
+    0.00180705529788636,  # 5: other-vehicle
+    0.00033758327431050,  # 6: person
+    0.00012711105887399,  # 7: bicyclist
+    0.00003746106399997,  # 8: motorcyclist
+    0.19879647126983287,  # 9: road
+    0.01471716954988821,  # 10: parking
+    0.14392298360372000,  # 11: sidewalk
+    0.00390485530374720,  # 12: other-ground
+    0.13268619447774860,  # 13: building
+    0.07235922294562230,  # 14: fence
+    0.26681502148037506,  # 15: vegetation
+    0.00603501201262603,  # 16: trunk
+    0.07814222006271769,  # 17: terrain
+    0.00285549819386317,  # 18: pole
+    0.00061559580861899,  # 19: traffic-sign
     ], dtype=torch.float32, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-    w_c = w_c/w_c.mean()
-    w_c = w_c.to(logits.dtype)
+    eps    = 1e-6
+    median = freqs[1:].median()    
+    w_c    = median / (freqs + eps)      # up‐weight rare classes
+    w_c[0] = 0.0                         # ignore void
+    w_c = w_c * (len(w_c) / w_c.sum())
+    # 1) CE (ignore void)
     ce = F.cross_entropy(logits, mask,
-                         weight=w_c,
-                         ignore_index=0,
-                         reduction='mean')
+                         ignore_index=0, reduction='mean', weight=w_c)
+    # 2) Dice
+    d  = dice_loss(logits, mask, num_classes, ignore_index=0)
     # 3) Lovasz
     l  = lovasz_softmax(logits, mask, ignore_index=0)
     # 4) Boundary
     b  = new_boundary_loss(logits, mask)
-    d = generalized_dice_loss(logits=logits, mask=mask, weights=w_c, ignore_index=0)
 
-    return w_ce*ce + w_lovasz*l + w_dice*d + w_boundary*b
+    return w_ce*ce + w_lovasz*l + w_boundary*b
 
 
-def evaluate_metrics(model, dataloader, num_classes=20,
+def evaluate_metrics(model, optimizer, dataloader, num_classes=20,
                      ignore_index=0, device='cuda'):
     # build confusion matrix
     conf_matrix = torch.zeros((num_classes, num_classes),
                               dtype=torch.long, device=device)
     model.eval()
-    # optimizer.eval()
+    #optimizer.eval()
     with torch.no_grad():
         for (in_vol, proj_mask, proj_labels, _, path_seq, path_name,
                 _, _, _, _, _, _, _, _, _) in dataloader:
@@ -341,93 +302,6 @@ def evaluate_metrics(model, dataloader, num_classes=20,
         'mean_acc': mean_acc,
         'miou': miou,
         'fw_iou': fw_iou,
-    }
-    
-@torch.no_grad()
-def evaluate_metrics_ddp(model,
-                         dataloader,
-                         num_classes: int = 20,
-                         ignore_index: int = 0,
-                         device: torch.device | None = None):
-    """
-    Computes pixel-accuracy, mean-accuracy, mIoU and fwIoU on the *full*
-    validation set in a DDP run.
-
-    • Each rank accumulates its local confusion-matrix.  
-    • `dist.all_reduce` sums those matrices across ranks.  
-    • Rank 0 returns/prints the metrics (others still return a dict so the
-      call is symmetric).
-
-    NOTE: the DataLoader may still use DistributedSampler; that is fine as
-    long as we aggregate here.
-    """
-    if device is None:
-        device = next(model.parameters()).device
-
-    # full C×C confusion matrix on *this* GPU
-    conf = torch.zeros(num_classes,
-                       num_classes,
-                       dtype=torch.long,
-                       device=device)
-
-    model.eval()
-    for batch in dataloader:
-        in_vol      = batch[0].to(device, non_blocking=True)   # projected voxels
-        target      = batch[2].to(device, non_blocking=True)   # proj_labels
-        logits, _   = model(in_vol)                            # forward
-        pred        = logits.argmax(1)
-
-        valid = target != ignore_index
-        t     = target[valid].view(-1)
-        p     = pred[valid].view(-1)
-        idx   = num_classes * t + p
-        conf += torch.bincount(idx,
-                               minlength=num_classes**2
-                               ).view(num_classes, num_classes)
-
-    # ---- gather from every GPU ----
-    if dist.is_initialized() and dist.get_world_size() > 1:
-        dist.all_reduce(conf, op=dist.ReduceOp.SUM)
-
-    # ---- derive metrics ----
-    total   = conf.sum().item()
-    correct = conf.trace().item()
-    pixel_acc = correct / total if total else 0.0
-
-    class_acc = []
-    ious, freqs = [], []
-    for cls in range(num_classes):
-        if cls == ignore_index:
-            continue
-        gt = conf[cls].sum().item()
-        if gt:
-            class_acc.append(conf[cls, cls].item() / gt)
-
-        tp = conf[cls, cls].item()
-        fp = conf[:, cls].sum().item() - tp
-        fn = conf[cls, :].sum().item() - tp
-        denom = tp + fp + fn
-        if denom:
-            iou = tp / denom
-            ious.append(iou)
-            freqs.append(conf[cls, :].sum().item() / total)
-            
-    cls_list = [c for c in range(num_classes) if c != ignore_index]
-    per_class_iou = {
-        cls: float(iou)
-        for cls, iou in zip(cls_list, ious)
-    }
-    
-    mean_acc = sum(class_acc) / len(class_acc) if class_acc else 0.0
-    miou     = sum(ious)      / len(ious)      if ious      else 0.0
-    fw_iou   = sum(f * i for f, i in zip(freqs, ious))       if ious else 0.0
-
-    return {
-        "pixel_acc": pixel_acc,
-        "mean_acc":  mean_acc,
-        "miou":      miou,
-        "fw_iou":    fw_iou,
-        "per_class_iou": per_class_iou
     }
 
 
@@ -491,7 +365,7 @@ def initiate_parser(rank, world_size, batch_size):
                                                    sampler=val_sampler,
                                                    num_workers=8,
                                                    pin_memory=True,
-                                                   drop_last=False)
+                                                   drop_last=True)
     return trainloader, validloader, train_sampler, val_sampler
 
 
@@ -516,64 +390,49 @@ def train(rank, args):
         model,
         device_ids=[rank]
     )
-    model = torch.compile(model)
     backbone_params = []
     other_params    = []
-    
+
     for n, p in model.named_parameters():
         if not p.requires_grad:
-            continue
-
-        # 1) pos-embeddings of the backbone → other_params
-        if "encoder.backbone" in n and "pos_embed" in n:
-            other_params.append(p)
-
-        # 2) remaining backbone weights → backbone_params
-        elif "encoder.backbone" in n:
-            backbone_params.append(p)
-
-        # 3) everything else → other_params
+            continue                      # frozen → skip completely
+        if "encoder.backbone" in n:       # <- matches the SAM2 trunk you kept
+            backbone_params.append(p)     #    (adapt the string if you renamed)
         else:
             other_params.append(p)
 
     # assert backbone_params, "didn't catch any backbone parameters — check the name!"
     # assert other_params,    "everything landed in the backbone group?"
+    # optimizer = optim.AdamW(
+    # [
+    #     {"params": other_params,    "lr": args.lr},   # heads, adapters, decoder
+    #     {"params": backbone_params, "lr": args.lr / 10},   # fine‑tune SAM2 trunk
+    # ],
+    #     weight_decay=args.weight_decay,
+    # )
     optimizer = optim.AdamW(
     [
-        {"params": other_params,    "lr": args.lr},   # heads, adapters, decoder
-        {"params": backbone_params, "lr": args.backbone_lr},   # fine‑tune SAM2 trunk
+        {"params": other_params,    "lr": args.lr},   # heads, adapters
     ],
         weight_decay=args.weight_decay,
     )
-    steps_per_epoch = len(train_loader)            # batches per epoch on this GPU
-    warmup_epochs   = args.warmup_epochs
-    warmup_steps    = warmup_epochs * steps_per_epoch
-    total_steps     = args.epochs * steps_per_epoch
     
-    warmup_scheduler = LinearLR(
-        optimizer,
-        start_factor=args.warmup_start_factor,     # e.g. 0.1
-        end_factor=1.0,
-        total_iters=warmup_steps,
-    )
-
-    cosine_scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=total_steps - warmup_steps,
-        eta_min=args.min_lr,                       # e.g. 1e-6
-    )
-
-    scheduler = SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[warmup_steps],                 # switch after warm-up
-    )
-    mIoU = 0
+    # steps_per_epoch = len(train_loader)  # local length on this rank
+    # scheduler = OneCycleLR(
+    #     optimizer,
+    #     max_lr=[args.lr, args.lr / 10],      # one value per param-group
+    #     epochs=args.epochs,
+    #     steps_per_epoch=steps_per_epoch,
+    #     pct_start=args.pct_start,
+    #     anneal_strategy="cos",               # smoother than "linear"
+    #     div_factor=args.div_factor,
+    #     final_div_factor=args.final_div_factor,
+    #     three_phase=args.three_phase,
+    # )
     os.makedirs(args.save_path, exist_ok=True)
-    weights = [1.0, 1.0, 1.0, 1.0]
     for epoch in range(1, args.epochs + 1):
         model.train()
-        # optimizer.train()
+        #optimizer.train()
         train_sampler.set_epoch(epoch)
         running_loss = 0.0
         for i, (in_vol, proj_mask, proj_labels, _, path_seq, path_name,
@@ -582,20 +441,20 @@ def train(rank, args):
             target = proj_labels.to(device, non_blocking=True).long()
             optimizer.zero_grad()
             out_main, out_aux= model(x)
+            weights = [1.0, 1.0, 0.5, 0.25]
             loss = combined_loss(out_main, target)  + sum(w * combined_loss(aux_pred, target) for w, aux_pred in zip(weights, out_aux))
             loss.backward()
             optimizer.step()
-            scheduler.step()
+            # scheduler.step()
             running_loss += loss.item()
             if rank == 0 and i % 50 == 0:
                 print(f"Epoch {epoch} [{i}/{len(train_loader)}]  Batch Loss: {loss.item():.4f}")
-                
         if rank == 0:
             avg_train_loss = running_loss / len(train_loader)
             print(f"Epoch {epoch} Training Loss: {avg_train_loss:.4f}")
         
-        if epoch >= 0 or epoch % 5 == 0 or epoch == args.epochs:
-            metrics = evaluate_metrics_ddp(model.module, val_loader, num_classes=20, ignore_index=0, device=device)
+        if epoch >= 5 or epoch % 5 == 0 or epoch == args.epochs:
+            metrics = evaluate_metrics(model.module, optimizer, val_loader, num_classes=20, ignore_index=0, device=device)
             if rank == 0:
                 print("Matrix:")
                 print(f"*** Validation metrics after epoch {epoch} ***")
@@ -603,13 +462,7 @@ def train(rank, args):
                 print(f"  Mean  Acc: {metrics['mean_acc']:.4f}")
                 print(f"  mIoU     : {metrics['miou']:.4f}")
                 print(f"  fwIoU    : {metrics['fw_iou']:.4f}")
-                print("Per-class IoUs:")
-                for cls, iou in metrics['per_class_iou'].items():
-                    print(f"  Class {cls:2d}: {iou:.4f}")
-                if metrics['miou'] > mIoU:
-                    print("New best mIoU!")
-                    ckpt = os.path.join(args.save_path, f'SAM2-UNet-epoch{epoch}-rank{rank}.pth')
-                    mIoU = metrics['miou']
+                ckpt = os.path.join(args.save_path, f'SAM2-UNet-epoch{epoch}-rank{rank}.pth')
                 torch.save(model.module.state_dict(), ckpt)
                 print(f"[Saved Snapshot:] {ckpt}")
     cleanup_ddp()
@@ -624,6 +477,7 @@ if __name__ == "__main__":
     parser.add_argument("--stem", required=True, type=str)
     parser.add_argument("--freeze_weight", type=str2bool, required=True,
                         help="Whether to freeze the weights (True/False)")
+    ###
     parser.add_argument("--adapter",       type=str2bool, required=True,
                         help="Whether to enable the adapter (True/False)")
     parser.add_argument("--msca",          type=str2bool, required=True,
@@ -639,15 +493,8 @@ if __name__ == "__main__":
                         help="number of GPUs for DDP")
     parser.add_argument("--unify_dim", type=int, default=256)
     parser.add_argument("--pos_emb", default=False, type=str2bool)
-    parser.add_argument("--warmup_epochs",       type=int,   default=5,
-                    help="linear warm-up duration (in epochs)")
-    parser.add_argument("--warmup_start_factor", type=float, default=0.1,
-                        help="initial LR = base_lr × start_factor during warm-up")
-    parser.add_argument("--min_lr",              type=float, default=1e-6,
-                        help="η_min for cosine annealing phase")
-    parser.add_argument("--backbone_lr",              type=float, default=0.001,
-                        help="lr for backbone")
-    ##########
+
+
     args = parser.parse_args()
     print("Parsed Arguments:")
     for arg, value in vars(args).items():
