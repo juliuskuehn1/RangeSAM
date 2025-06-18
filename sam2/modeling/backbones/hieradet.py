@@ -185,9 +185,9 @@ class Hiera(nn.Module):
         # window size per stage, when not using global att.
         window_spec: Tuple[int, ...] = (
             4,
-            4,
-            4,
-            4,
+            8,
+            16,
+            8,
         ),
         # global attn in these blocks
         global_att_blocks: Tuple[int, ...] = (

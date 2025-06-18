@@ -10,19 +10,30 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import autocast
+import torch.distributed as dist
+import torch.multiprocessing as mp
 #from kitti_dataloader import MultiSeqNpZDataset, Seq02NpZDataset
 from RSAMconv import SAM2UNet
 from preprocess.parser import Parser, SemanticKitti
 from utils.utils import *
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
-import deepspeed
-torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(True)
-torch.backends.cuda.enable_math_sdp(False)
+from schedulefree import AdamWScheduleFree
+
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy, MixedPrecision, CPUOffload
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+from torch.distributed.fsdp import (
+    StateDictType, FullStateDictConfig, ShardedStateDictConfig
+)
+from torch.distributed.checkpoint.state_dict import (
+    get_state_dict,
+    StateDictOptions
+)
+
+from sam2.modeling.backbones.hieradet import Hiera
+
 torch.set_float32_matmul_precision('high')
-from deepspeed.runtime.activation_checkpointing import checkpointing
-from deepspeed.accelerator import get_accelerator
 
 def class_balanced_mean(loss, mask, ignore_index=0, num_classes=None):
     """
@@ -177,11 +188,59 @@ def new_boundary_loss(logits, mask, theta0=3):
 
     return loss.mean()
 
+###########
+# Dice loss
+###########
+
+def dice_loss(logits, mask, num_classes, ignore_index=0, smooth=1e-6):
+    probs = F.softmax(logits, 1)
+    gt    = F.one_hot(mask.clamp(min=0), num_classes).permute(0, 3, 1, 2).float()
+    valid = (mask != ignore_index).unsqueeze(1).float()
+    probs, gt = probs * valid, gt * valid
+    inter = (probs * gt).sum((0, 2, 3))
+    union = probs.sum((0, 2, 3)) + gt.sum((0, 2, 3))
+    dice  = (2 * inter + smooth) / (union + smooth)
+    dice  = dice[1:]
+    return 1. - dice.mean()
+
+def generalized_dice_loss(logits,
+                           mask,
+                           weights=None,      # 1-D tensor [C]
+                           ignore_index=0,
+                           smooth=1e-6):
+    """
+    Sudre et al., ‘Generalised Dice overlap…’ (2017)
+    """
+    B, C, H, W = logits.shape
+    device = logits.device
+
+    # ----- one-hot ground truth, skip ignore -----
+    valid = mask != ignore_index
+    gt = F.one_hot(mask.clamp(min=0), C).permute(0,3,1,2).float() * valid.unsqueeze(1)
+    prob = F.softmax(logits, 1) * valid.unsqueeze(1)
+
+    # ----- class weights -----
+    if weights is None:
+        freq = gt.sum((0,2,3)) + smooth          # per-class voxel count
+        w = 1.0 / (freq * freq)                  # 1 / freq²
+    else:
+        w = weights.to(device).float()
+    w = w / (w.max() + 1e-6)                     # optional normalisation
+    if ignore_index < C:
+        w[ignore_index] = 0                      # make sure ignore class is zero-weighted
+
+    # ----- numerator & denominator (scalars) -----
+    intersect = torch.sum(w * (prob * gt).sum((0,2,3)))     # scalar
+    union     = torch.sum(w * (prob + gt).sum((0,2,3)))     # scalar
+
+    dice = (2 * intersect + smooth) / (union + smooth)
+    return 1.0 - dice
+
 # -----------------------------------------------------------------------------
 # 4) Combined loss
 # -----------------------------------------------------------------------------
 def combined_loss(logits, mask, num_classes=20,
-                  w_ce=1, w_lovasz=1.5, w_boundary=1):
+                  w_ce=1, w_lovasz=1, w_dice=1, w_boundary=1):
     """
     A mix of four losses:
       - standard cross-entropy
@@ -189,42 +248,6 @@ def combined_loss(logits, mask, num_classes=20,
       - Lovasz-Softmax
       - boundary-sensitive
     """
-    # freqs = torch.tensor([
-    # 0.03150183342534689,  # 0: unlabeled (void)
-    # 0.04260782867450238,  # 1: car
-    # 0.00016609538710765,  # 2: bicycle
-    # 0.00039838616015114,  # 3: motorcycle
-    # 0.00216493982413381,  # 4: truck
-    # 0.00180705529788636,  # 5: other-vehicle
-    # 0.00033758327431050,  # 6: person
-    # 0.00012711105887399,  # 7: bicyclist
-    # 0.00003746106399997,  # 8: motorcyclist
-    # 0.19879647126983287,  # 9: road
-    # 0.01471716954988821,  # 10: parking
-    # 0.14392298360372000,  # 11: sidewalk
-    # 0.00390485530374720,  # 12: other-ground
-    # 0.13268619447774860,  # 13: building
-    # 0.07235922294562230,  # 14: fence
-    # 0.26681502148037506,  # 15: vegetation
-    # 0.00603501201262603,  # 16: trunk
-    # 0.07814222006271769,  # 17: terrain
-    # 0.00285549819386317,  # 18: pole
-    # 0.00061559580861899,  # 19: traffic-sign
-    # ], dtype=torch.float32, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-    # eps    = 1e-4
-    # median = freqs[1:].median()
-    # p = 1.5    
-    # w_c    = median / (freqs + eps)       # up‐weight rare classes
-    # w_c[0] = 0.0                         # ignore void
-    # w_c = w_c * (len(w_c) / w_c.sum())
-    # 1) CE (ignore void)
-    # ce = focal_cross_entropy(
-    #             logits,
-    #             mask,
-    #             gamma=2.0,
-    #             alpha=w_c,         # ← your class weights here
-    #             ignore_index=0
-    #         )
     w_c = torch.tensor([
     30.767496,   # 0: unlabeled
     22.931664,   # 1: car
@@ -248,7 +271,6 @@ def combined_loss(logits, mask, num_classes=20,
    618.966736    # 19: traffic-sign
     ], dtype=torch.float32, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
     w_c = w_c/w_c.mean()
-    w_c[0] = 0
     w_c = w_c.to(logits.dtype)
     ce = F.cross_entropy(logits, mask,
                          weight=w_c,
@@ -258,7 +280,6 @@ def combined_loss(logits, mask, num_classes=20,
     l  = lovasz_softmax(logits, mask, ignore_index=0)
     # 4) Boundary
     b  = new_boundary_loss(logits, mask)
-
     return w_ce*ce + w_lovasz*l + w_boundary*b
 
 
@@ -317,72 +338,91 @@ def evaluate_metrics(model, dataloader, num_classes=20,
     }
     
 @torch.no_grad()
-def evaluate_metrics_ddp(model, dataloader, num_classes=20,
-                         ignore_index=0):
-    device = model.local_rank
-    conf = torch.zeros((num_classes, num_classes),
+def evaluate_metrics_ddp(model,
+                         dataloader,
+                         num_classes: int = 20,
+                         ignore_index: int = 0,
+                         device: torch.device | None = None):
+    """
+    Computes pixel-accuracy, mean-accuracy, mIoU and fwIoU on the *full*
+    validation set in a DDP run.
+
+    • Each rank accumulates its local confusion-matrix.  
+    • `dist.all_reduce` sums those matrices across ranks.  
+    • Rank 0 returns/prints the metrics (others still return a dict so the
+      call is symmetric).
+
+    NOTE: the DataLoader may still use DistributedSampler; that is fine as
+    long as we aggregate here.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    # full C×C confusion matrix on *this* GPU
+    conf = torch.zeros(num_classes,
+                       num_classes,
                        dtype=torch.long,
                        device=device)
+
     model.eval()
-    
-    for (in_vol, proj_mask, proj_labels, *_rest) in dataloader:
-        x = in_vol.to(device, non_blocking=True)
-        target = proj_labels.to(device, non_blocking=True)
+    for batch in dataloader:
+        in_vol      = batch[0].to(device, non_blocking=True)   # projected voxels
+        target      = batch[2].to(device, non_blocking=True)   # proj_labels
+        logits, _   = model(in_vol)                            # forward
+        pred        = logits.argmax(1)
 
-        logits, _ = model(x)              
-        preds = logits.argmax(dim=1)
-        valid_mask = target != ignore_index
+        valid = target != ignore_index
+        t     = target[valid].view(-1)
+        p     = pred[valid].view(-1)
+        idx   = num_classes * t + p
+        conf += torch.bincount(idx,
+                               minlength=num_classes**2
+                               ).view(num_classes, num_classes)
 
-        t = target[valid_mask].view(-1)
-        p = preds[valid_mask].view(-1)
-        idx = num_classes * t + p
-        cm = torch.bincount(idx, minlength=num_classes**2)
-        conf += cm.reshape(num_classes, num_classes)
+    # ---- gather from every GPU ----
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(conf, op=dist.ReduceOp.SUM)
 
-    #all_reduce manually:
-    torch.distributed.all_reduce(conf, op=torch.distributed.ReduceOp.SUM)
-
-    total = conf.sum().item()
+    # ---- derive metrics ----
+    total   = conf.sum().item()
     correct = conf.trace().item()
     pixel_acc = correct / total if total else 0.0
 
     class_acc = []
-    counts = conf.sum(dim=1)
-    for cls in range(num_classes):
-        if cls == ignore_index:
-            continue
-        gt_count = counts[cls].item()
-        if gt_count > 0:
-            class_acc.append(conf[cls, cls].item() / gt_count)
-    mean_acc = sum(class_acc) / len(class_acc) if class_acc else 0.0
-
     ious, freqs = [], []
     for cls in range(num_classes):
         if cls == ignore_index:
             continue
+        gt = conf[cls].sum().item()
+        if gt:
+            class_acc.append(conf[cls, cls].item() / gt)
+
         tp = conf[cls, cls].item()
         fp = conf[:, cls].sum().item() - tp
         fn = conf[cls, :].sum().item() - tp
         denom = tp + fp + fn
-        if denom > 0:
+        if denom:
             iou = tp / denom
             ious.append(iou)
             freqs.append(conf[cls, :].sum().item() / total)
-    miou = sum(ious) / len(ious) if ious else 0.0
-    fw_iou = sum(f * i for f, i in zip(freqs, ious)) if ious else 0.0
+            
+    cls_list = [c for c in range(num_classes) if c != ignore_index]
+    per_class_iou = {
+        cls: float(iou)
+        for cls, iou in zip(cls_list, ious)
+    }
+    
+    mean_acc = sum(class_acc) / len(class_acc) if class_acc else 0.0
+    miou     = sum(ious)      / len(ious)      if ious      else 0.0
+    fw_iou   = sum(f * i for f, i in zip(freqs, ious))       if ious else 0.0
 
-    # Only rank 0 prints or returns metrics for logging
-    if torch.distributed.get_rank() == 0:
-        return {
-            'pixel_acc': pixel_acc,
-            'mean_acc': mean_acc,
-            'miou': miou,
-            'fw_iou': fw_iou,
-            'per_class_iou': {cls: float(iou) for cls, iou in zip(
-                [c for c in range(num_classes) if c != ignore_index], ious)}
-        }
-    else:
-        return None
+    return {
+        "pixel_acc": pixel_acc,
+        "mean_acc":  mean_acc,
+        "miou":      miou,
+        "fw_iou":    fw_iou,
+        "per_class_iou": per_class_iou
+    }
 
 
 def seed_torch(seed=1904):
@@ -395,6 +435,16 @@ def seed_torch(seed=1904):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
+
+def setup_ddp(rank, world_size):
+    os.environ['MASTER_ADDR'] = '127.0.0.1'
+    os.environ['MASTER_PORT'] = '29500'
+    dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+
+def cleanup_ddp():
+    dist.destroy_process_group()
 
 def initiate_parser(rank, world_size, batch_size):
     ARCH = load_yaml("config/arch/LENet.yaml")
@@ -412,15 +462,22 @@ def initiate_parser(rank, world_size, batch_size):
                               drop_few_static_frames=False
                               )
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
+
+    trainloader = torch.utils.data.DataLoader(train_dataset,
+                                                   batch_size=batch_size,
+                                                   sampler=train_sampler,
+                                                   num_workers=8,
+                                                   pin_memory=True,
+                                                   drop_last=False)
     valid_dataset = SemanticKitti(root="dataset",
-                            sequences=DATA["split"]["valid"],
-                            labels=DATA["labels"],
-                            color_map=DATA["color_map"],
-                            learning_map=DATA["learning_map"],
-                            learning_map_inv=DATA["learning_map_inv"],
-                            sensor=ARCH["dataset"]["sensor"],
-                            max_points=ARCH["dataset"]["max_points"],
-                            gt=True)
+                                  sequences=DATA["split"]["valid"],
+                                  labels=DATA["labels"],
+                                  color_map=DATA["color_map"],
+                                  learning_map=DATA["learning_map"],
+                                  learning_map_inv=DATA["learning_map_inv"],
+                                  sensor=ARCH["dataset"]["sensor"],
+                                  max_points=ARCH["dataset"]["max_points"],
+                                  gt=True)
     val_sampler = DistributedSampler(valid_dataset, num_replicas=world_size, rank=rank, shuffle=False)
     validloader = torch.utils.data.DataLoader(valid_dataset,
                                                    batch_size=batch_size,
@@ -428,19 +485,24 @@ def initiate_parser(rank, world_size, batch_size):
                                                    sampler=val_sampler,
                                                    num_workers=8,
                                                    pin_memory=True,
-                                                   drop_last=False)
-    return train_dataset, validloader, train_sampler, val_sampler
+                                                   drop_last=True)
+    return trainloader, validloader, train_sampler, val_sampler
 
+def auto_wrap_policy(module, recurse, nonwrapped_numel):
+    if isinstance(module, Hiera):
+        return False
+    return size_based_auto_wrap_policy(
+        module,
+        recurse,
+        nonwrapped_numel,
+        min_num_params=int(1e7),
+    )
 
-
-def train(args):
-    
-    # Init deepspeed and get the local rank
-    deepspeed.init_distributed()
-    _local_rank = int(os.environ.get("LOCAL_RANK"))
-    get_accelerator().set_device(_local_rank)
-    
-    # Define the model we're working with
+def train(rank, args):
+    setup_ddp(rank, args.world_size)
+    seed_torch(1904 + rank)
+    train_loader, val_loader, train_sampler, val_sampler = initiate_parser(rank, args.world_size, args.batch_size)
+    device = torch.device(f"cuda:{rank}")
     model = SAM2UNet(
         "sam2.1_hiera_t.yaml",
         "sam2.1_hiera_tiny.pt",
@@ -452,83 +514,105 @@ def train(args):
         use_rfb=args.use_rfb,        # True / False
         pos_emb=args.pos_emb,
     )
+    backbone_params = []
+    other_params    = []
     
-    #Filter out the trainable parameters
-    parameters = filter(lambda p: p.requires_grad, model.parameters())
-    
-    # Declare a dataset for deepspeed.initialize()
-    ARCH = load_yaml("config/arch/LENet.yaml")
-    DATA = load_yaml("config/labels/semantic-kitti.yaml")
-    train_dataset =SemanticKitti(root="dataset",
-                            sequences=DATA["split"]["train"],
-                            labels=DATA["labels"],
-                            color_map=DATA["color_map"],
-                            learning_map=DATA["learning_map"],
-                            learning_map_inv=DATA["learning_map_inv"],
-                            sensor=ARCH["dataset"]["sensor"],
-                            max_points=ARCH["dataset"]["max_points"],
-                            transform=True,
-                            gt=True,
-                            drop_few_static_frames=False
-                            )
-    valid_dataset = SemanticKitti(root="dataset",
-                                sequences=DATA["split"]["valid"],
-                                labels=DATA["labels"],
-                                color_map=DATA["color_map"],
-                                learning_map=DATA["learning_map"],
-                                learning_map_inv=DATA["learning_map_inv"],
-                                sensor=ARCH["dataset"]["sensor"],
-                                max_points=ARCH["dataset"]["max_points"],
-                                gt=True)
-    # Initialize the wrapped model, optimizer, trainloader and scheduler
-    model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
-        args=args,                        
-        model=model,
-        model_parameters=parameters,
-        training_data=train_dataset,
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+
+        # 1) pos-embeddings of the backbone → other_params
+        if "encoder.backbone" in n and "pos_embed" in n:
+            other_params.append(p)
+
+        # 2) remaining backbone weights → backbone_params
+        elif "encoder.backbone" in n:
+            backbone_params.append(p)
+
+        # 3) everything else → other_params
+        else:
+            other_params.append(p)
+    mixed_precision = MixedPrecision(
+        param_dtype=torch.bfloat16,   # fp16 params & grads
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16,
     )
-    local_device = get_accelerator().device_name(model_engine.local_rank)
-    local_rank = model_engine.local_rank
+    opts = StateDictOptions(
+        full_state_dict=True,      # gather the full tensor on each param
+        cpu_offload=True,          # offload to CPU as you go to save GPU memory
+    )
+    model = FSDP(
+        model,
+        auto_wrap_policy=auto_wrap_policy,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,  
+        device_id=rank,
+        mixed_precision=mixed_precision,
+        cpu_offload=CPUOffload(offload_params=False),
+        forward_prefetch=True,           # helps throughput for encoder/decoder nets
+        use_orig_params=True,            # keeps original Param semantics (PyTorch ≥2.2)
+    )
+    # assert backbone_params, "didn't catch any backbone parameters — check the name!"
+    # assert other_params,    "everything landed in the backbone group?"
+    optimizer = optim.AdamW(
+    [
+        {"params": other_params,    "lr": args.lr},   # heads, adapters, decoder
+        {"params": backbone_params, "lr": args.backbone_lr},   # fine‑tune SAM2 trunk
+    ],
+        weight_decay=args.weight_decay,
+    )
+    steps_per_epoch = len(train_loader)            # batches per epoch on this GPU
+    warmup_epochs   = args.warmup_epochs
+    warmup_steps    = warmup_epochs * steps_per_epoch
+    total_steps     = args.epochs * steps_per_epoch
     
-    # checkpointing.configure(
-    #     mpu_=None,
-    #     partition_activations=True,
-    #     contiguous_checkpointing=True)
-    rank       = args.local_rank
-    world_size = model_engine.world_size  
-    seed_torch(1904 + rank)
-    _, val_loader, _, _ =  initiate_parser(rank, world_size, args.batch_size)
-    # model_engine = torch.compile(model_engine)
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=args.warmup_start_factor,     # e.g. 0.1
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps - warmup_steps,
+        eta_min=args.min_lr,                       # e.g. 1e-6
+    )
+
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_steps],                 # switch after warm-up
+    )
     mIoU = 0
     os.makedirs(args.save_path, exist_ok=True)
+    weights = [1.0, 1.0, 1.0, 1.0]
     for epoch in range(1, args.epochs + 1):
-        model_engine.train()
+        model.train()
+        # optimizer.train()
+        train_sampler.set_epoch(epoch)
         running_loss = 0.0
-        for i, (in_vol, proj_mask, proj_labels, _, path_seq, path_name,
+        for i, (in_vol, _, proj_labels, _, _, _,
                 _, _, _, _, _, _, _, _, _) in enumerate(train_loader, 1):
-            x = in_vol.to(local_device, non_blocking=True).to(torch.bfloat16)
-            target = proj_labels.to(local_device, non_blocking=True).long()
-            model_engine.zero_grad()
-            out_main, out_aux = model_engine(x)
-            weights = [1.0, 1.0, 1.0, 1.0]
-            # compute loss
-            loss_main = combined_loss(out_main, target)
-            loss_aux  = sum(w * combined_loss(aux_pred, target) for w, aux_pred in zip(weights, out_aux))
-            loss      = loss_main + loss_aux
-            
-            model_engine.backward(loss)
-            model_engine.step()
+            x = in_vol.to(device, non_blocking=True)
+            target = proj_labels.to(device, non_blocking=True).long()
+            optimizer.zero_grad()
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                out_main, out_aux= model(x)
+            loss = combined_loss(out_main, target)  + sum(w * combined_loss(aux_pred, target) for w, aux_pred in zip(weights, out_aux))
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
             running_loss += loss.item()
-            if local_rank == 0 and i % 50 == 0:
+            if rank == 0 and i % 50 == 0:
                 print(f"Epoch {epoch} [{i}/{len(train_loader)}]  Batch Loss: {loss.item():.4f}")
                 
-        if local_rank == 0:
+        if rank == 0:
             avg_train_loss = running_loss / len(train_loader)
             print(f"Epoch {epoch} Training Loss: {avg_train_loss:.4f}")
         
         if epoch >= 0 or epoch % 5 == 0 or epoch == args.epochs:
-            metrics = evaluate_metrics_ddp(model_engine, val_loader, num_classes=20, ignore_index=0)
-            if local_rank == 0:
+            metrics = evaluate_metrics_ddp(model, val_loader, num_classes=20, ignore_index=0, device=device)
+            if rank == 0:
                 print("Matrix:")
                 print(f"*** Validation metrics after epoch {epoch} ***")
                 print(f"  Pixel Acc: {metrics['pixel_acc']:.4f}")
@@ -540,10 +624,16 @@ def train(args):
                     print(f"  Class {cls:2d}: {iou:.4f}")
                 if metrics['miou'] > mIoU:
                     print("New best mIoU!")
-                    tag = f"epoch{epoch}"
-                    model_engine.save_checkpoint(args.save_path, tag=tag)
-                    if local_rank == 0:
-                        print(f"[Saved Snapshot:] {args.save_path}/{tag}")
+                    # ckpt = os.path.join(args.save_path, f'SAM2-UNet-epoch{epoch}-rank{rank}.pth')
+                    # mIoU = metrics['miou']
+                    # fsdp_state = get_state_dict(
+                    #     model,
+                    #     optimizer,
+                    #     options=opts
+                    # )
+                    # torch.save(fsdp_state, ckpt)
+                    # print(f"[Saved Snapshot:] {ckpt}")
+    cleanup_ddp()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("SAM2-UNet DDP")
@@ -562,34 +652,27 @@ if __name__ == "__main__":
     ##########
     parser.add_argument("--epochs", type=int, default=20,
                         help="training epochs")
-    parser.add_argument("--batch_size", default=2, type=int)
+    parser.add_argument("--lr", type=float, default=0.001, help="learning rate")
+    parser.add_argument("--batch_size", default=4, type=int)
     parser.add_argument("--use_rfb", default=False, type=str2bool)
+    parser.add_argument("--weight_decay", default=0.00025, type=float)
+    parser.add_argument("--world_size", type=int, default=torch.cuda.device_count(),
+                        help="number of GPUs for DDP")
     parser.add_argument("--unify_dim", type=int, default=256)
     parser.add_argument("--pos_emb", default=False, type=str2bool)
+    parser.add_argument("--warmup_epochs",       type=int,   default=5,
+                    help="linear warm-up duration (in epochs)")
     parser.add_argument("--warmup_start_factor", type=float, default=0.1,
                         help="initial LR = base_lr × start_factor during warm-up")
     parser.add_argument("--min_lr",              type=float, default=1e-6,
                         help="η_min for cosine annealing phase")
     parser.add_argument("--backbone_lr",              type=float, default=0.001,
                         help="lr for backbone")
-    parser.add_argument(
-        "--local_rank",
-        type=int,
-        default=0,
-        help="(added by deepspeed launcher) local GPU rank"
-    )
-    parser = deepspeed.add_config_arguments(parser)
+    parser.add_argument("--offload",          type=str2bool, required=False,
+                        help="Whether to offload to CPU")
     ##########
     args = parser.parse_args()
     print("Parsed Arguments:")
     for arg, value in vars(args).items():
         print(f"{arg:20}: {value}")
-    train(args)
-
-
-#   "fp16": {
-#     "enabled": true,
-#     "loss_scale": 0,
-#     "loss_scale_window": 1000,
-#     "initial_scale_power": 32
-#   },
+    mp.spawn(train, args=(args,), nprocs=args.world_size, join=True)

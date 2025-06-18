@@ -17,58 +17,76 @@ class RSAMRFEncoder(nn.Module):
         del model.obj_ptr_proj
         del model.image_encoder.neck
         self.backbone = model.image_encoder.trunk
-        self.backbone.window_spec = (3, 3, 3 ,3)
         self.pos_emb = pos_emb
-        if not self.pos_emb:
-            del self.backbone.pos_embed
-            del self.backbone.pos_embed_window
+        del self.backbone.pos_embed
+        del self.backbone.pos_embed_window
         self.stem = self.backbone.patch_embed.proj
-        self.pos_emb = pos_emb
         out_channels = self.backbone.patch_embed.proj.out_channels
         del self.backbone.patch_embed.proj
+        # self.stem = nn.Sequential(
+        #     nn.Linear(5, out_channels//4),
+        #     nn.LayerNorm(out_channels//4),
+        #     nn.GELU(),
+        #     nn.Linear(out_channels//4, out_channels//2),
+        #     nn.LayerNorm(out_channels//2),
+        #     nn.GELU(),
+        #     nn.Linear(out_channels//2, out_channels),
+        #     nn.LayerNorm(out_channels),
+        #     nn.GELU(),
+        # ) 
         self.stem = nn.Sequential(
-            nn.Linear(5, out_channels//4),
-            nn.LayerNorm(out_channels//4),
+            nn.Conv2d(5, out_channels//4, kernel_size=1, padding=0),
+            nn.BatchNorm2d(out_channels//4),
             nn.GELU(),
-            nn.Linear(out_channels//4, out_channels//2),
-            nn.LayerNorm(out_channels//2),
+            nn.Conv2d(out_channels//4, out_channels//2, kernel_size=1, padding=0),
+            nn.BatchNorm2d(out_channels//2),
             nn.GELU(),
-            nn.Linear(out_channels//2, out_channels),
-            nn.LayerNorm(out_channels),
+            nn.Conv2d(out_channels//2, out_channels, kernel_size=1, padding=0),
+            nn.BatchNorm2d(out_channels),
             nn.GELU(),
         )
-        self.patch_embed = nn.ModuleList([
-            nn.Conv2d(out_channels*1, out_channels*1, kernel_size=3, padding=1),
-        ])
+        self.patch_embed = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         if freeze_weight:
             for param in self.backbone.parameters():
                 param.requires_grad = False
         adapted_blocks = nn.ModuleList()
         for block in self.backbone.blocks:
             adapted_blocks.append(
-                VeryBestAdapter(block)
+                BestAdapter(block)
             )
         self.backbone.blocks = adapted_blocks
-        self.act = nn.GELU()
-
+        if self.pos_emb:
+            self.pos_embed = nn.Parameter(
+                torch.zeros(1, out_channels, 4, 128)
+            )
+            self.pos_embed_window = nn.Parameter(
+                torch.zeros(1, out_channels, 4, 4)
+            )
+    def _get_pos_embed(self, hw) -> torch.Tensor:
+        h, w = hw
+        window_embed = self.pos_embed_window
+        pos_embed = F.interpolate(self.pos_embed, size=(h, w), mode="bicubic")
+        pos_embed = pos_embed + window_embed.tile(
+            [x // y for x, y in zip(pos_embed.shape, window_embed.shape)]
+        )
+        pos_embed = pos_embed.permute(0, 2, 3, 1)
+        return pos_embed
+    
     def forward(self, x):
         outputs = []
-        x = x.permute(0, 2, 3, 1)
+        #x = x.permute(0, 2, 3, 1)
         x = self.stem(x)
-        x = x.permute(0, 3, 1, 2)
-        x = self.patch_embed[0](x)
+        #x = x.permute(0, 3, 1, 2)
+        x = self.patch_embed(x)
+        # outputs.append(x)
         x = x.permute(0, 2, 3, 1)
         if (self.pos_emb):
-            x = x + self.backbone._get_pos_embed(x.shape[1:3])
-        stage_idx = 0
-        patch_embed_idx = 1
+            x = x + self._get_pos_embed(x.shape[1:3])
         for i, blk in enumerate(self.backbone.blocks):
             x = blk(x)
             if i in self.backbone.stage_ends:
                 feat = x.permute(0, 3, 1, 2)
                 outputs.append(feat)
-                x = feat.permute(0, 2, 3, 1)
-                stage_idx += 1
         return outputs
 
 class RSAMDecoder(nn.Module):
@@ -86,22 +104,18 @@ class RSAMDecoder(nn.Module):
             self.conv3 = nn.Conv2d(out_channels*4, unify_dim, kernel_size=1)
             self.conv4 = nn.Conv2d(out_channels*8, unify_dim, kernel_size=1)
         self.main_head = nn.Sequential(
-            nn.Conv2d(unify_dim * 4, unify_dim * 2, 1),
-            nn.GELU(),
-            nn.Conv2d(unify_dim * 2, unify_dim * 1, 1),
-            nn.GELU(),
+            nn.Conv2d(unify_dim * 4, unify_dim * 1, 1),
             nn.Conv2d(unify_dim * 1, 20, 1)
         )
         self.aux_heads = nn.ModuleList([
             nn.Conv2d(unify_dim, 20, 1) for _ in range(4)
         ])
-
     def forward(self, x):
         x1, x2, x3, x4 = x
         H = 64
         W = 2048
         if self.use_rfb:
-            x1, x2, x3, x4 = self.rfb1(x1), self.rfb2(x2), self.rfb3(x3), self.rfb4(x4)
+            x1, x2, x3, x4 = self.rfb1(x1),  self.rfb2(x2), self.rfb3(x3),  self.rfb4(x4)
         else:
             x1, x2, x3, x4 = self.conv1(x1), self.conv2(x2), self.conv3(x3), self.conv4(x4)
         if x1.shape[-2:] != (H, W):

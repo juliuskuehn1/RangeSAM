@@ -138,19 +138,15 @@ class DoubleConv(nn.Module):
             mid_channels = out_channels
         self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.GELU()
         )
 
     def forward(self, x):
         return self.double_conv(x)
     
     
-
-
 class Up(nn.Module):
     """Upscaling then double conv"""
 
@@ -158,7 +154,7 @@ class Up(nn.Module):
         super().__init__()
 
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
+        self.conv = DoubleConv(in_channels, out_channels, in_channels *4)
 
     def forward(self, x1, x2):
         x1 = self.up(x1)
@@ -307,7 +303,7 @@ class BestAdapter(nn.Module):
             dim, dim,
             kernel_size=3, padding=1, groups=dim, bias=True
         )
-        self.norm = nn.LayerNorm(dim)
+        self.linear = nn.Linear(dim, dim)
         self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:       
@@ -315,9 +311,8 @@ class BestAdapter(nn.Module):
         out = x.permute(0, 3, 1, 2)
         out = self.dwconv(out)
         out = out.permute(0, 2, 3, 1)
-        out = self.norm(out)
         out = self.act(out)                     
-        return out + x
+        return self.linear(out) + x
 
 class VeryBestAdapter(nn.Module):
     def __init__(self, blk):
@@ -325,29 +320,49 @@ class VeryBestAdapter(nn.Module):
         self.block = blk
         dim = blk.dim_out          # = channel dim C
         self.act = nn.GELU()
-        msca_blocks = []
-        self.msca_blocks = SpatialAttention(dim)
+        self.msca_blocks = SpatialAttention(dim*2)
         self.dropout = nn.Dropout2d(p=0.2)
-        self.conv1 = nn.Conv2d(dim*1, dim*1, 1)
-        self.conv2 = nn.Conv2d(dim, dim, 1)
-        self.norm1 =nn.LayerNorm(dim*1)
-        self.norm2 = nn.LayerNorm(dim*1)
+        self.linear1 = nn.Linear(dim, dim*2)
+        self.linear2 = nn.Linear(dim*2, dim)
     def forward(self, x: torch.Tensor) -> torch.Tensor:       
         feat = self.block(x)
-        feat = feat.permute(0, 3, 1, 2)
-        out = self.conv1(feat)
-        out = out.permute(0, 2, 3, 1)
-        out = self.norm1(out)
-        out = self.act(out)
+        feat = self.linear1(feat)
+        out = self.act(feat)
         out = out.permute(0, 3, 1, 2)
         out = self.dropout(self.msca_blocks(out)) + out
+        out = out.permute(0, 2, 3, 1)
         feat = feat + out
-        feat = self.conv2(feat)
-        feat = feat.permute(0, 2, 3, 1)
-        feat = self.norm2(feat)
-        feat = self.act(feat)
+        feat = self.linear2(feat)
         return feat
+    
+    
+class UltimateAdapter(nn.Module):
+    def __init__(self, blk: nn.Module, num_convs: int = 1):
+        super().__init__()
+        self.block = blk
+        self.dim   = blk.dim_out
+        self.linear = nn.Linear(self.dim, self.dim)
+        convs = []
+        convs.extend([
+            nn.Conv2d(self.dim * 1, self.dim * 1, kernel_size=1, groups=self.dim, bias=True),
+            nn.GELU(),
+        ])
+        for _ in range(num_convs):
+            convs.extend([
+                nn.Conv2d(self.dim * 4, self.dim * 4,
+                          kernel_size=3, padding=1,
+                          groups=self.dim, bias=True),
+                nn.GELU(),
+            ])
+        self.dw_stack = nn.Sequential(*convs)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.block(x)
+        out = x.permute(0, 3, 1, 2)
+        out = self.dw_stack(out)
+        out = out.permute(0, 2, 3, 1)
+        return self.linear(out) + x
+    
 class DropoutAdapter(nn.Module):
     def __init__(self, blk):
         super().__init__()
@@ -386,16 +401,15 @@ class BasicConv2d(nn.Module):
                               kernel_size=kernel_size, stride=stride,
                               padding=padding, dilation=dilation, bias=False)
         self.ln = nn.LayerNorm(out_planes)
-        self.act = nn.GELU()
-        self.gelu = gelu
+        #self.act = nn.GELU()
+        #self.gelu = gelu
 
     def forward(self, x):
         x = self.conv(x)
         x = x.permute(0, 2, 3, 1)
         x = self.ln(x)
-        x = self.act(x)
-        x = x.permute(0, 3, 1, 2)
-        return x
+        #x = self.act(x)
+        return x.permute(0, 3, 1, 2)
 
 
 class RFB_modified(nn.Module):

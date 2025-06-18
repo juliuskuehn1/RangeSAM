@@ -267,9 +267,7 @@ def combined_loss(logits, mask, num_classes=20,
     l  = lovasz_softmax(logits, mask, ignore_index=0)
     # 4) Boundary
     b  = new_boundary_loss(logits, mask)
-    d = generalized_dice_loss(logits=logits, mask=mask, ignore_index=0)
-
-    return w_ce*ce + w_lovasz*l + w_dice*d + w_boundary*b
+    return w_ce*ce + w_lovasz*l + w_boundary*b
 
 
 def evaluate_metrics(model, dataloader, num_classes=20,
@@ -457,7 +455,7 @@ def initiate_parser(rank, world_size, batch_size):
                                                    sampler=train_sampler,
                                                    num_workers=8,
                                                    pin_memory=True,
-                                                   drop_last=True)
+                                                   drop_last=False)
     valid_dataset = SemanticKitti(root="dataset",
                                   sequences=DATA["split"]["valid"],
                                   labels=DATA["labels"],
@@ -474,7 +472,7 @@ def initiate_parser(rank, world_size, batch_size):
                                                    sampler=val_sampler,
                                                    num_workers=8,
                                                    pin_memory=True,
-                                                   drop_last=False)
+                                                   drop_last=True)
     return trainloader, validloader, train_sampler, val_sampler
 
 
@@ -495,18 +493,17 @@ def train(rank, args):
         use_rfb=args.use_rfb,        # True / False
         pos_emb=args.pos_emb,
     ).to(device)
+    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = torch.nn.parallel.DistributedDataParallel(
         model,
         device_ids=[rank]
     )
-    model = torch.compile(model)
     backbone_params = []
     other_params    = []
     
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
-
         # 1) pos-embeddings of the backbone → other_params
         if "encoder.backbone" in n and "pos_embed" in n:
             other_params.append(p)
@@ -559,7 +556,7 @@ def train(rank, args):
         # optimizer.train()
         train_sampler.set_epoch(epoch)
         running_loss = 0.0
-        for i, (in_vol, proj_mask, proj_labels, _, path_seq, path_name,
+        for i, (in_vol, _, proj_labels, _, _, _,
                 _, _, _, _, _, _, _, _, _) in enumerate(train_loader, 1):
             x = in_vol.to(device, non_blocking=True)
             target = proj_labels.to(device, non_blocking=True).long()
