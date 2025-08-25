@@ -26,10 +26,15 @@ from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 from torch.distributed.fsdp import (
     StateDictType, FullStateDictConfig, ShardedStateDictConfig
 )
+import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint.state_dict import (
     get_state_dict,
+    set_state_dict,
     StateDictOptions
 )
+from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
+
 
 from sam2.modeling.backbones.hieradet import Hiera
 
@@ -497,6 +502,38 @@ def auto_wrap_policy(module, recurse, nonwrapped_numel):
         nonwrapped_numel,
         min_num_params=int(1e7),
     )
+    
+class AppState(Stateful):
+    """This is a useful wrapper for checkpointing the Application State. Since this object is compliant
+    with the Stateful protocol, DCP will automatically call state_dict/load_stat_dict as needed in the
+    dcp.save/load APIs.
+
+    Note: We take advantage of this wrapper to hande calling distributed state dict methods on the model
+    and optimizer.
+    """
+
+    def __init__(self, model, optimizer=None):
+        self.model = model
+        self.optimizer = optimizer
+    def state_dict(self):
+        opts = StateDictOptions(
+            full_state_dict=True,      # gather the full tensor on each param
+            cpu_offload=True,          # offload to CPU as you go to save GPU memory
+        )
+        model_state_dict, optimizer_state_dict = get_state_dict(self.model, self.optimizer, options=opts)
+        return {
+            "model": model_state_dict,
+            "optim": optimizer_state_dict
+        }
+
+    def load_state_dict(self, state_dict):
+        # sets our state dicts on the model and optimizer, now that we've loaded
+        set_state_dict(
+            self.model,
+            self.optimizer,
+            model_state_dict=state_dict["model"],
+            optim_state_dict=state_dict["optim"]
+        )
 
 def train(rank, args):
     setup_ddp(rank, args.world_size)
@@ -532,21 +569,16 @@ def train(rank, args):
         # 3) everything else → other_params
         else:
             other_params.append(p)
-    mixed_precision = MixedPrecision(
-        param_dtype=torch.bfloat16,   # fp16 params & grads
-        reduce_dtype=torch.bfloat16,
-        buffer_dtype=torch.bfloat16,
-    )
-    opts = StateDictOptions(
-        full_state_dict=True,      # gather the full tensor on each param
-        cpu_offload=True,          # offload to CPU as you go to save GPU memory
-    )
+    # mixed_precision = MixedPrecision(
+    #     param_dtype=torch.bfloat16,   # fp16 params & grads
+    #     reduce_dtype=torch.bfloat16,
+    #     buffer_dtype=torch.bfloat16,
+    # )
     model = FSDP(
         model,
         auto_wrap_policy=auto_wrap_policy,
         sharding_strategy=ShardingStrategy.FULL_SHARD,  
-        device_id=rank,
-        mixed_precision=mixed_precision,
+        device_id=rank,         #mixed_precision=mixed_precision,
         cpu_offload=CPUOffload(offload_params=False),
         forward_prefetch=True,           # helps throughput for encoder/decoder nets
         use_orig_params=True,            # keeps original Param semantics (PyTorch ≥2.2)
@@ -624,8 +656,8 @@ def train(rank, args):
                     print(f"  Class {cls:2d}: {iou:.4f}")
                 if metrics['miou'] > mIoU:
                     print("New best mIoU!")
-                    # ckpt = os.path.join(args.save_path, f'SAM2-UNet-epoch{epoch}-rank{rank}.pth')
-                    # mIoU = metrics['miou']
+                    #ckpt = os.path.join(args.save_path, f'SAM2-UNet-epoch{epoch}-rank{rank}.pth')
+                    mIoU = metrics['miou']
                     # fsdp_state = get_state_dict(
                     #     model,
                     #     optimizer,
@@ -633,6 +665,14 @@ def train(rank, args):
                     # )
                     # torch.save(fsdp_state, ckpt)
                     # print(f"[Saved Snapshot:] {ckpt}")
+            ckpt = os.path.join(args.save_path, f'SAM2-UNet-epoch{epoch}-rank{rank}.pth')
+            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(
+                        model, StateDictType.FULL_STATE_DICT, save_policy
+                    ):
+                        cpu_state = model.state_dict()
+            if rank == 0:
+                torch.save(cpu_state, ckpt)
     cleanup_ddp()
 
 if __name__ == "__main__":

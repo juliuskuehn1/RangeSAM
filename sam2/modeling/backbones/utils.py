@@ -24,15 +24,16 @@ def window_partition(x, window_size):
         (Hp, Wp): padded height and width before partition
     """
     B, H, W, C = x.shape
-
-    pad_h = (window_size - H % window_size) % window_size
-    pad_w = (window_size - W % window_size) % window_size
+    window_h = window_size
+    window_w = window_size * 8
+    pad_h = (window_h - H % window_h) % window_h
+    pad_w = (window_w - W % window_w) % window_w
     if pad_h > 0 or pad_w > 0:
         x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
     Hp, Wp = H + pad_h, W + pad_w
 
-    x = x.view(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
-    windows = x.permute(0, 1, 3, 2, 4, 5).reshape(-1, window_size, window_size, C)
+    x = x.view(B, Hp // window_h, window_h, Wp // window_w, window_w, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).reshape(-1, window_h, window_w, C)
     return windows, (Hp, Wp)
 
 
@@ -47,11 +48,13 @@ def window_unpartition(windows, window_size, pad_hw, hw):
     Returns:
         x: unpartitioned sequences with [B, H, W, C].
     """
+    window_h = window_size
+    window_w = window_size * 8 ###
     Hp, Wp = pad_hw
     H, W = hw
-    B = windows.shape[0] // (Hp * Wp // window_size // window_size)
+    B = windows.shape[0] // (Hp * Wp // window_h // window_w)
     x = windows.reshape(
-        B, Hp // window_size, Wp // window_size, window_size, window_size, -1
+        B, Hp // window_h, Wp // window_w, window_h, window_w, -1
     )
     x = x.permute(0, 1, 3, 2, 4, 5).reshape(B, Hp, Wp, -1)
 

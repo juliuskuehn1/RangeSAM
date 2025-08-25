@@ -15,7 +15,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 #from kitti_dataloader import MultiSeqNpZDataset, Seq02NpZDataset
 from RSAMconv import SAM2UNet
-from preprocess.parser import Parser, SemanticKitti
+from preprocess.nuscenes_parser import Parser, SemanticKitti
 from utils.utils import *
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 from schedulefree import AdamWScheduleFree
@@ -56,9 +56,9 @@ def class_balanced_mean(loss, mask, ignore_index=0, num_classes=None):
     return mean_per_class.mean()
 
 # -----------------------------------------------------------------------------
-# 1) Focal loss (soft, averaged over classes 1…C-1)
+# 1) Dice loss (soft, averaged over classes 1…C-1)
 # -----------------------------------------------------------------------------
-def focal_cross_entropy_cb(logits, mask, gamma=2.0, alpha=None, ignore_index=0, reduction='mean'):
+def focal_cross_entropy(logits, mask, gamma=2.0, alpha=None, ignore_index=0, reduction='mean'):
     """
     Focal loss with optional per-class α weighting.
       logits:     [B, C, H, W]
@@ -84,33 +84,10 @@ def focal_cross_entropy_cb(logits, mask, gamma=2.0, alpha=None, ignore_index=0, 
         
     return class_balanced_mean(loss, mask, ignore_index=0, num_classes=20)
 
-def focal_cross_entropy(logits, mask,
-                        gamma = 2.0,
-                        alpha = None,
-                        ignore_index = 0):
-    """
-    Focal loss (Lin et al. RetinaNet) with optional α‑weighting.
-    - logits: [B, C, H, W]
-    - mask:   [B, H, W] with values in 0..C-1 (use -100 for ignore_index)
-    """
-    # 1) CE with per-class weight built in
-    ce = F.cross_entropy(logits, mask,
-                         weight=alpha,
-                         ignore_index=ignore_index,
-                         reduction='none')  # [B,H,W]
 
-    # 2) compute p_t and detach it so focusing term doesn't introduce extra gradients
-    p_t = torch.exp(-ce).detach()         # [B,H,W]
-
-    # 3) focal scaling
-    loss = (1 - p_t)**gamma * ce          # [B,H,W]
-
-    # 4) average only over non-ignored pixels
-    valid = (mask != ignore_index)
-    return loss[valid].mean()
 
 # -----------------------------------------------------------------------------
-# 2) Lovász-Softmax 
+# 2) Lovász-Softmax (see: https://arxiv.org/abs/1705.08790)
 # -----------------------------------------------------------------------------
 def lovasz_softmax(logits, mask, ignore_index=0):
     C = logits.size(1)
@@ -202,7 +179,7 @@ def new_boundary_loss(logits, mask, theta0=3):
 # Dice loss
 ###########
 
-def dice_loss(logits, mask, num_classes=20, ignore_index=0, smooth=1e-6):
+def dice_loss(logits, mask, num_classes, ignore_index=0, smooth=1e-6):
     probs = F.softmax(logits, 1)
     gt    = F.one_hot(mask.clamp(min=0), num_classes).permute(0, 3, 1, 2).float()
     valid = (mask != ignore_index).unsqueeze(1).float()
@@ -259,40 +236,35 @@ def combined_loss(logits, mask, num_classes=20,
       - boundary-sensitive
     """
     w_c = torch.tensor([
-    0,   # 0: unlabeled
-    22.931664,   # 1: car
-   857.562744,   # 2: bicycle
-   715.110046,   # 3: motorcycle
-   315.961761,   # 4: truck
-   356.245178,   # 5: other-vehicle
-   747.617004,   # 6: person
-   887.223938,   # 7: bicyclist
-   963.891541,   # 8: motorcyclist
-     5.005093,   # 9: road
-    63.624687,   # 10: parking
-     6.900217,   # 11: sidewalk
-   203.879608,   # 12: other-ground
-     7.480204,   # 13: building
-    13.631550,   # 14: fence
-     3.733921,   # 15: vegetation
-   142.146164,   # 16: trunk
-    12.635481,   # 17: terrain
-   259.369873,   # 18: pole
-   618.966736    # 19: traffic-sign
+        0.003526,  # 0: noise
+        0.155848,  # 1: barrier
+        9.471894,  # 2: bicycle
+        0.286126,  # 3: bus
+        0.033190,  # 4: car
+        1.007083,  # 5: construction_vehicle
+        3.045953,  # 6: motorcycle
+        0.581494,  # 7: pedestrian
+        1.873330,  # 8: traffic_cone
+        0.248090,  # 9: trailer
+        0.083362,  # 10: truck
+        0.003882,  # 11: driveable_surface
+        0.153769,  # 12: other_flat
+        0.017596,  # 13: sidewalk
+        0.017875,  # 14: terrain
+        0.006914,  # 15: manmade
+        0.010066   # 16: vegetation
     ], dtype=torch.float32, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+    # w_c = w_c/w_c.mean()
     w_c = w_c.to(logits.dtype)
     ce = F.cross_entropy(logits, mask,
                          weight=w_c,
                          ignore_index=0,
                          reduction='mean')
-    # ce = focal_cross_entropy(logits=logits, mask=mask, gamma=2, alpha=w_c, ignore_index=0)
-    # 2) Dice
-    d = dice_loss(logits, mask, ignore_index=0)
     # 3) Lovasz
     l  = lovasz_softmax(logits, mask, ignore_index=0)
     # 4) Boundary
     b  = new_boundary_loss(logits, mask)
-    return w_ce*ce + w_lovasz*l + w_boundary*b + w_dice*d
+    return w_ce*ce + w_lovasz*l + w_boundary*b
 
 
 def evaluate_metrics(model, dataloader, num_classes=20,
@@ -303,7 +275,7 @@ def evaluate_metrics(model, dataloader, num_classes=20,
     model.eval()
     # optimizer.eval()
     with torch.no_grad():
-        for (in_vol, _, proj_labels, _, path_seq, path_name,
+        for (in_vol, proj_mask, proj_labels, _, path_seq, path_name,
                 _, _, _, _, _, _, _, _, _) in dataloader:
             x = in_vol.to(device, non_blocking=True)
             target = proj_labels.to(device, non_blocking=True)
@@ -459,9 +431,9 @@ def cleanup_ddp():
     dist.destroy_process_group()
 
 def initiate_parser(rank, world_size, batch_size):
-    ARCH = load_yaml("config/arch/LENet.yaml")
-    DATA = load_yaml("config/labels/semantic-kitti.yaml")
-    train_dataset =SemanticKitti(root="dataset",
+    ARCH = load_yaml("config/arch/LENet_nusc.yaml")
+    DATA = load_yaml("config/labels/semantic-nuscenes.yaml")
+    train_dataset =SemanticKitti(root="temp_dataset/nuScenes_converted",
                               sequences=DATA["split"]["train"],
                               labels=DATA["labels"],
                               color_map=DATA["color_map"],
@@ -481,7 +453,7 @@ def initiate_parser(rank, world_size, batch_size):
                                                    num_workers=8,
                                                    pin_memory=True,
                                                    drop_last=False)
-    valid_dataset = SemanticKitti(root="dataset",
+    valid_dataset = SemanticKitti(root="temp_dataset/nuScenes_converted",
                                   sequences=DATA["split"]["valid"],
                                   labels=DATA["labels"],
                                   color_map=DATA["color_map"],
@@ -500,46 +472,7 @@ def initiate_parser(rank, world_size, batch_size):
                                                    drop_last=True)
     return trainloader, validloader, train_sampler, val_sampler
 
-def load_ported_weights(new_model, old_ckpt_path, verbose=True):
-    ckpt = torch.load(old_ckpt_path, map_location='cpu', weights_only=False)
-    old_sd = ckpt.get('model_state_dict', ckpt)  # handle raw state_dict saves
 
-    new_sd = new_model.state_dict()
-    transfer = {}
-    skipped = []
-    mismatched = []
-
-    # keys to drop (anything you replaced)
-    drop_prefixes = (
-        'decoder.main_head',     # e.g. decoder.main_head.0.weight
-        'decoder.aux_heads',     # e.g. decoder.aux_heads.0.weight
-    )
-
-    for k, v in old_sd.items():
-        if k.startswith(drop_prefixes):
-            skipped.append(k)
-            continue
-        # only take tensors that exist in new model with identical shape
-        if k in new_sd and new_sd[k].shape == v.shape:
-            transfer[k] = v
-        else:
-            mismatched.append(k)
-
-    # load only the transferred weights; leave everything else as-is
-    missing, unexpected = new_model.load_state_dict(transfer, strict=False)
-
-    if verbose:
-        print(f'Loaded {len(transfer)} tensors from old checkpoint.')
-        if skipped:
-            print(f'Skipped (by design): {len(skipped)} e.g.: {skipped[:5]}')
-        if mismatched:
-            print(f'Shape-mismatched (not loaded): {len(mismatched)} e.g.: {mismatched[:5]}')
-        if missing:
-            print(f'Missing in checkpoint (expected by new model): {len(missing)} e.g.: {missing[:5]}')
-        if unexpected:
-            print(f'Unexpected in checkpoint (not in new model): {len(unexpected)} e.g.: {unexpected[:5]}')
-
-    return new_model
 
 def train(rank, args):
     setup_ddp(rank, args.world_size)
@@ -557,14 +490,11 @@ def train(rank, args):
         use_rfb=args.use_rfb,        # True / False
         pos_emb=args.pos_emb,
     ).to(device)
-    total = sum(p.numel() for p in model.parameters())
-    print(f"Total number of parameters: {total:,}")
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = torch.nn.parallel.DistributedDataParallel(
         model,
         device_ids=[rank]
     )
-    model = load_ported_weights(model, "/workspace/pretrained_weights/best_nuscenes_pretrain_2.pth", verbose=True)
     backbone_params = []
     other_params    = []
     
@@ -615,7 +545,6 @@ def train(rank, args):
         schedulers=[warmup_scheduler, cosine_scheduler],
         milestones=[warmup_steps],                 # switch after warm-up
     )
-    
     mIoU = 0
     os.makedirs(args.save_path, exist_ok=True)
     weights = [1.0, 1.0, 1.0, 1.0]
@@ -625,7 +554,7 @@ def train(rank, args):
         train_sampler.set_epoch(epoch)
         running_loss = 0.0
         for i, (in_vol, _, proj_labels, _, _, _,
-                _, _, _, _, _, _, _, _, _) in enumerate(train_loader, 1):
+                _, _, _, _, _, _, _, _, _, _) in enumerate(train_loader, 1):
             x = in_vol.to(device, non_blocking=True)
             target = proj_labels.to(device, non_blocking=True).long()
             optimizer.zero_grad()
@@ -690,7 +619,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_epochs",       type=int,   default=5,
                     help="linear warm-up duration (in epochs)")
     parser.add_argument("--warmup_start_factor", type=float, default=0.1,
-                        help="initial LR = base_lr x start_factor during warm-up")
+                        help="initial LR = base_lr × start_factor during warm-up")
     parser.add_argument("--min_lr",              type=float, default=1e-6,
                         help="η_min for cosine annealing phase")
     parser.add_argument("--backbone_lr",              type=float, default=0.001,

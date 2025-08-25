@@ -564,7 +564,6 @@ def train(rank, args):
         model,
         device_ids=[rank]
     )
-    model = load_ported_weights(model, "/workspace/pretrained_weights/best_nuscenes_pretrain_2.pth", verbose=True)
     backbone_params = []
     other_params    = []
     

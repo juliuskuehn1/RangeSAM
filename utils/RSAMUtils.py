@@ -298,21 +298,42 @@ class BestAdapter(nn.Module):
     def __init__(self, blk):
         super().__init__()
         self.block = blk
-        dim = blk.dim_out          # = channel dim C
+        dim = blk.dim_out         
         self.dwconv  = nn.Conv2d(
-            dim, dim,
-            kernel_size=3, padding=1, groups=dim, bias=True
+            dim, dim*4,
+            kernel_size=(3,3), padding="same", groups=dim, bias=False
         )
-        self.linear = nn.Linear(dim, dim)
+        self.linear = nn.Linear(dim*4, dim)
         self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:       
         x = self.block(x)
         out = x.permute(0, 3, 1, 2)
+        out = self.act(out)
         out = self.dwconv(out)
         out = out.permute(0, 2, 3, 1)
-        out = self.act(out)                     
+        out = self.act(out)                                    
         return self.linear(out) + x
+
+class SimplestAdapter(nn.Module):
+    def __init__(self, blk):
+        super().__init__()
+        self.block = blk
+        dim = blk.dim_out
+        # self.dwconv  = nn.Conv2d(
+        #     dim, dim*4,
+        #     kernel_size=3, padding=1, groups=dim, bias=True
+        # )
+        self.linear1 = nn.Linear(dim, dim*4)
+        self.linear2 = nn.Linear(dim*4, dim)
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:       
+        x = self.block(x)
+        out = self.act(x)
+        out = self.linear1(out)
+        out = self.act(out)                     
+        return self.linear2(out) + x
 
 class VeryBestAdapter(nn.Module):
     def __init__(self, blk):
@@ -368,7 +389,6 @@ class DropoutAdapter(nn.Module):
         super().__init__()
         self.block = blk
         dim = blk.attn.qkv.in_features          # = channel dim C
-
         self.linear1 = nn.Linear(dim, dim*4)
         # self.conv1 = nn.Conv2d(dim, dim*4, kernel_size=1)
         self.dwconv  = nn.Conv2d(
@@ -395,20 +415,19 @@ class DropoutAdapter(nn.Module):
         return out
 
 class BasicConv2d(nn.Module):
-    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, gelu=False):
+    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, gelu=False, groups=1):
         super(BasicConv2d, self).__init__()
         self.conv = nn.Conv2d(in_planes, out_planes,
                               kernel_size=kernel_size, stride=stride,
-                              padding=padding, dilation=dilation, bias=False)
+                              padding=padding, dilation=dilation, groups=groups, bias=False)
         self.ln = nn.LayerNorm(out_planes)
-        #self.act = nn.GELU()
-        #self.gelu = gelu
+        self.act = nn.GELU()
 
     def forward(self, x):
         x = self.conv(x)
         x = x.permute(0, 2, 3, 1)
         x = self.ln(x)
-        #x = self.act(x)
+        x = self.act(x)
         return x.permute(0, 3, 1, 2)
 
 
@@ -450,6 +469,204 @@ class RFB_modified(nn.Module):
         x = self.relu(x_cat + self.conv_res(x))
         return x
 
+class RSegRFB(nn.Module):
+    def __init__(self, in_channel, out_channel):
+        super(RSegRFB, self).__init__()
+        self.relu = nn.ReLU(True)
+        self.branch0 = nn.Sequential(
+            BasicConv2d(in_channel*1 , out_channel*1, 1, groups=96),
+        )
+        self.branch1 = nn.Sequential(
+            BasicConv2d(in_channel*1 , out_channel*1, 1, groups=96),
+            BasicConv2d(out_channel*1, out_channel*1, kernel_size=(1, 5), padding=(0, 2), groups=96),
+            BasicConv2d(out_channel*1, out_channel*1, kernel_size=(3, 1), padding=(1, 0), groups=96),
+            BasicConv2d(out_channel*1, out_channel*1, 3, padding=3, dilation=3, groups=96)
+        )
+        self.branch2 = nn.Sequential(
+            BasicConv2d(in_channel*1 , out_channel*1, 1, groups=96),
+            BasicConv2d(out_channel*1, out_channel*1, kernel_size=(1, 7), padding=(0, 3), groups=96),
+            BasicConv2d(out_channel*1, out_channel*1, kernel_size=(5, 1), padding=(2, 0), groups=96),
+            BasicConv2d(out_channel*1, out_channel*1, 3, padding=5, dilation=5, groups=96)
+        )
+        self.branch3 = nn.Sequential(
+            BasicConv2d(in_channel*1 , out_channel*1, 1, groups=96),
+            BasicConv2d(out_channel*1, out_channel*1, kernel_size=(1, 9), padding=(0, 4), groups=96),
+            BasicConv2d(out_channel*1, out_channel*1, kernel_size=(7, 1), padding=(3, 0), groups=96),
+            BasicConv2d(out_channel*1, out_channel*1, 3, padding=7, dilation=7, groups=96)
+        )
+        self.conv_cat = BasicConv2d(4 * out_channel, out_channel, 3, padding=1, groups=96)
+        self.conv_res = BasicConv2d(in_channel, out_channel, 1, groups=96)
+
+    def forward(self, x):
+        x0 = self.branch0(x)
+        x1 = self.branch1(x)
+        x2 = self.branch2(x)
+        x3 = self.branch3(x)
+        x_cat = self.conv_cat(torch.cat((x0, x1, x2, x3), 1))
+
+        x = self.relu(x_cat + self.conv_res(x))
+        return x
 
 def print_train_config(model_cfg, checkpoint_path, stem, freeze_weight, adapter, msca):
     print("Training config:")
+
+############################################
+
+class ConvStem(nn.Module):
+    def __init__(self,
+                 in_channels=6,
+                 base_channels=12,
+                 img_size=(64, 2048),
+                 patch_stride=(2, 8),
+                 embed_dim=96,
+                 flatten=False,
+                 hidden_dim=192):
+        super().__init__()
+
+        if hidden_dim is None:
+            hidden_dim = 2 * base_channels
+
+        self.base_channels = base_channels
+        self.dropout_ratio = 0.2
+
+        # Build stem, similar to the design in https://github.com/TiagoCortinhal/SalsaNext
+        self.conv_block = nn.Sequential(
+            ResContextBlock(in_channels, base_channels),
+            ResContextBlock(base_channels, base_channels*2),
+            ResContextBlock(base_channels*2, base_channels*4),
+            ResBlock(base_channels*4, hidden_dim, self.dropout_ratio, pooling=False, drop_out=False))
+
+        assert patch_stride[0] % 2 == 0
+        assert patch_stride[1] % 2 == 0
+        kernel_size = (patch_stride[0] + 1, patch_stride[1] + 1)
+        padding = (patch_stride[0] // 2, patch_stride[1] // 2)
+        self.proj_block = nn.Sequential(
+             nn.AvgPool2d(kernel_size=kernel_size, stride=patch_stride, padding=padding),
+             nn.Conv2d(hidden_dim, embed_dim, kernel_size=1))
+
+        self.patch_stride = patch_stride
+        self.patch_size = patch_stride
+        self.grid_size = (img_size[0] // patch_stride[0], img_size[1] // patch_stride[1])
+        self.num_patches = self.grid_size[0] * self.grid_size[1]
+        self.flatten = flatten
+
+    # def get_grid_size(self, H, W):
+    #     return get_grid_size_2d(H, W, self.patch_size, self.patch_stride)
+
+    def forward(self, x):
+        B, C, H, W = x.shape  # B, in_channels, image_size[0], image_size[1]
+        x_base = self.conv_block(x) # B, hidden_dim, image_size[0], image_size[1]
+        x = self.proj_block(x_base)
+        if self.flatten:
+            x = x.flatten(2).transpose(1, 2)  # BCHW -> BNC
+        return x 
+
+
+class ResContextBlock(nn.Module):
+    # From T. Cortinhal et al.
+    # https://github.com/TiagoCortinhal/SalsaNext
+    def __init__(self, in_filters, out_filters):
+        super(ResContextBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_filters, out_filters, kernel_size=(1, 1), stride=1)
+        self.act1 = nn.LeakyReLU()
+
+        self.conv2 = nn.Conv2d(out_filters, out_filters, (3, 3), padding=1)
+        self.act2 = nn.LeakyReLU()
+        self.bn1 = nn.LayerNorm(out_filters)
+
+        self.conv3 = nn.Conv2d(out_filters, out_filters, (3, 3), dilation=2, padding=2)
+        self.act3 = nn.LeakyReLU()
+        self.bn2 = nn.LayerNorm(out_filters)
+
+    def forward(self, x):
+        shortcut = self.conv1(x)
+        shortcut = self.act1(shortcut)
+
+        resA = self.conv2(shortcut)
+        resA = self.act2(resA)
+        resA = resA.permute(0, 2, 3, 1)
+        resA1 = self.bn1(resA)
+        resA1 = resA1.permute(0, 3, 1, 2)
+        resA = self.conv3(resA1)
+        resA = self.act3(resA)
+        resA = resA.permute(0, 2, 3, 1)
+        resA2 = self.bn2(resA)
+        resA2 = resA2.permute(0, 3, 1, 2)
+        output = shortcut + resA2
+        return output
+
+
+class ResBlock(nn.Module):
+    # From T. Cortinhal et al.
+    # https://github.com/TiagoCortinhal/SalsaNext
+    def __init__(self, in_filters, out_filters, dropout_rate, kernel_size=(3, 3), stride=1,
+                 pooling=True, drop_out=True):
+        super(ResBlock, self).__init__()
+        self.pooling = pooling
+        self.drop_out = drop_out
+        self.conv1 = nn.Conv2d(in_filters, out_filters, kernel_size=(1, 1), stride=stride)
+        self.act1 = nn.LeakyReLU()
+
+        self.conv2 = nn.Conv2d(in_filters, out_filters, kernel_size=(3, 3), padding=1)
+        self.act2 = nn.LeakyReLU()
+        self.bn1 = nn.LayerNorm(out_filters)
+
+        self.conv3 = nn.Conv2d(out_filters, out_filters, kernel_size=(3, 3), dilation=2, padding=2)
+        self.act3 = nn.LeakyReLU()
+        self.bn2 = nn.LayerNorm(out_filters)
+
+        self.conv4 = nn.Conv2d(out_filters, out_filters, kernel_size=(2, 2), dilation=2, padding=1)
+        self.act4 = nn.LeakyReLU()
+        self.bn3 = nn.LayerNorm(out_filters)
+
+        self.conv5 = nn.Conv2d(out_filters * 3, out_filters, kernel_size=(1, 1))
+        self.act5 = nn.LeakyReLU()
+        self.bn4 = nn.LayerNorm(out_filters)
+
+        if pooling:
+            self.dropout = nn.Dropout2d(p=dropout_rate)
+            self.pool = nn.AvgPool2d(kernel_size=kernel_size, stride=2, padding=1)
+        else:
+            self.dropout = nn.Dropout2d(p=dropout_rate)
+
+    def forward(self, x):
+        shortcut = self.conv1(x)
+        shortcut = self.act1(shortcut)
+
+        resA = self.conv2(x)
+        resA = self.act2(resA)
+        resA = resA.permute(0, 2, 3, 1)
+        resA1 = self.bn1(resA)
+        resA1 = resA1.permute(0, 3, 1, 2)
+        resA = self.conv3(resA1)
+        resA = self.act3(resA)
+        resA = resA.permute(0, 2, 3, 1)
+        resA2 = self.bn2(resA)
+        resA2 = resA2.permute(0, 3, 1, 2)
+        resA = self.conv4(resA2)
+        resA = self.act4(resA)
+        resA = resA.permute(0, 2, 3, 1)
+        resA3 = self.bn3(resA)
+        resA3 = resA3.permute(0, 3, 1, 2)
+        concat = torch.cat((resA1, resA2, resA3), dim=1)
+        resA = self.conv5(concat)
+        resA = self.act5(resA)
+        resA = resA.permute(0, 2, 3, 1)
+        resA = self.bn4(resA)
+        resA = resA.permute(0, 3, 1, 2)
+        resA = shortcut + resA
+
+        if self.pooling:
+            if self.drop_out:
+                resB = self.dropout(resA)
+            else:
+                resB = resA
+            resB = self.pool(resB)
+
+            return resB, resA
+        else:
+            if self.drop_out:
+                resB = self.dropout(resA)
+            else:
+                resB = resA
+            return resB

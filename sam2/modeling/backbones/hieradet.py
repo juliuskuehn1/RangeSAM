@@ -181,13 +181,13 @@ class Hiera(nn.Module):
         stages: Tuple[int, ...] = (2, 3, 16, 3),  # blocks per stage
         dim_mul: float = 2.0,  # dim_mul factor at stage shift
         head_mul: float = 2.0,  # head_mul factor at stage shift
-        window_pos_embed_bkg_spatial_size: Tuple[int, int] = (14, 14),
+        window_pos_embed_bkg_spatial_size: Tuple[int, int] = (14, 14), ###
         # window size per stage, when not using global att.
         window_spec: Tuple[int, ...] = (
-            4,
             8,
-            16,
-            8,
+            16, ###
+            16, ###
+            8, ###
         ),
         # global attn in these blocks
         global_att_blocks: Tuple[int, ...] = (

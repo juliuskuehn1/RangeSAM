@@ -114,42 +114,76 @@ class LaserScan:
         self.set_points(points, remissions)
 
     def set_points(self, points, remissions=None):
-        """ Set scan attributes (instead of opening from file)
-        """
-        # reset just in case there was an open structure
+        """ Set scan attributes (instead of opening from file) """
+        # reset
         self.reset()
-
-        # check scan makes sense
         if not isinstance(points, np.ndarray):
             raise TypeError("Scan should be numpy array")
-
-        # check remission makes sense
         if remissions is not None and not isinstance(remissions, np.ndarray):
             raise TypeError("Remissions should be numpy array")
 
-        # put in attribute
-        self.points = points  # get
-        if self.flip_sign:
-            self.points[:, 1] = -self.points[:, 1]
-        if self.DA:
-            jitter_x = random.uniform(-5, 5)
-            jitter_y = random.uniform(-3, 3)
-            jitter_z = random.uniform(-1, 0)
-            self.points[:, 0] += jitter_x
-            self.points[:, 1] += jitter_y
-            self.points[:, 2] += jitter_z
-        if self.rot:
-            self.points = self.points @ R.random(random_state=1234).as_dcm().T
-        if remissions is not None:
-            self.remissions = remissions  # get remission
-            # if self.DA:
-            #    self.remissions = self.remissions[::-1].copy()
-        else:
-            self.remissions = np.zeros((points.shape[0]), dtype=np.float32)
+        # ---------------- CommonAug config from RangeFormer ----------------
+        r_s = 0.05  # scaling ±5%
+        r_j = 0.3   # jitter std (m)
+        # -------------------------------------------------------------------
 
-        # if projection is wanted, then do it and fill in the structure
+        pts = points.astype(np.float32, copy=True)
+
+        # (1) Random Scaling (XY only; paper’s numpy code scales x,y)  [p=1.0]
+        if self.DA:
+            scale = np.random.uniform(1.0, 1.0 + r_s)
+            if np.random.rand() < 0.5:
+                scale = 1.0 / scale
+            pts[:, 0] *= scale
+            pts[:, 1] *= scale
+            # note: paper text mentions (x,y,z), but Algorithm 1 scales XY; we follow Algorithm 1. :contentReference[oaicite:2]{index=2} :contentReference[oaicite:3]{index=3}
+
+        # (2) Global Rotation (yaw in XY)  [p=1.0]
+        if self.rot:
+            ang = np.random.uniform(0.0, 2.0 * np.pi)
+            c, s = np.cos(ang), np.sin(ang)
+            rot2 = np.array([[c, s], [-s, c]], dtype=np.float32)
+            pts[:, :2] = pts[:, :2].dot(rot2)
+
+        # (3) Random Jittering (per-point, clip 3σ)  [p=1.0]
+        if self.DA:
+            jitter = np.random.normal(0.0, r_j, size=pts[:, :3].shape).astype(np.float32)
+            np.clip(jitter, -3*r_j, 3*r_j, out=jitter)
+            pts[:, :3] += jitter
+
+        # (4) Random Flipping (X only / Y only / both)  [p=1.0]
+        if self.flip_sign:
+            flip_type = np.random.randint(0, 4)  # 0=none,1=x,2=y,3=both
+            if flip_type == 1:
+                pts[:, 0] = -pts[:, 0]
+            elif flip_type == 2:
+                pts[:, 1] = -pts[:, 1]
+            elif flip_type == 3:
+                pts[:, :2] = -pts[:, :2]
+
+        # (5) Random Dropping (rate passed in; applied with p=0.9 in caller)
+        self.points_to_drop = None
+        drop_points = 0.1
+        if self.drop_points:
+            max_drop = int(len(pts) * float(drop_points))
+            drop = np.random.randint(0, max_drop + 1) if max_drop > 0 else 0
+            if drop > 0:
+                to_drop = np.random.randint(0, len(pts), size=drop)
+                to_drop = np.unique(to_drop)
+                pts = np.delete(pts, to_drop, axis=0)
+                if remissions is not None:
+                    remissions = np.delete(remissions, to_drop)
+                self.points_to_drop = to_drop  # used by SemLaserScan.open_label
+
+        # finalize
+        self.points = pts
+        self.remissions = remissions.astype(np.float32) if remissions is not None \
+                        else np.zeros((pts.shape[0]), dtype=np.float32)
+
+        # project if requested
         if self.project:
             self.do_range_projection()
+
 
     def do_range_projection(self):
         """ Project a pointcloud into a spherical projection image.projection.
@@ -351,13 +385,13 @@ class SemLaserScan(LaserScan):
         self.proj_sem_label = np.zeros(
             (self.proj_H, self.proj_W), dtype=np.int32)  # [H,W]  label
         self.proj_sem_color = np.zeros(
-            (self.proj_H, self.proj_W, 3), dtype=np.float32)  # [H,W,3] color
+            (self.proj_H, self.proj_W, 3), dtype=float)  # [H,W,3] color
 
         # projection color with instance labels
         self.proj_inst_label = np.zeros(
             (self.proj_H, self.proj_W), dtype=np.int32)  # [H,W]  label
         self.proj_inst_color = np.zeros(
-            (self.proj_H, self.proj_W, 3), dtype=np.float32)  # [H,W,3] color
+            (self.proj_H, self.proj_W, 3), dtype=float)  # [H,W,3] color
 
     def open_label(self, filename):
         """ Open raw scan and fill in attributes """
@@ -392,7 +426,7 @@ class SemLaserScan(LaserScan):
         else:
             print("Points shape: ", self.points.shape)
             print("Label shape: ", label.shape)
-            print("Laser scan in common calling")
+            print("Laser scan in preprocess calling")
             raise ValueError(
                 "Scan and Label don't contain same number of points")
 

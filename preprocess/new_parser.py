@@ -227,39 +227,6 @@ class SemanticKitti(Dataset):
 
         print(
             f"\033[32m Using {self.dataset_size} scans from sequences {self.sequences}\033[0m")
-        
-    def sample_scan(self, dataset_index, current_pose):
-            # -------- 0. sample a second scan (rv_b, rvl_b) ------------------
-            # pick a random frame different from the current one
-            idx_b = random.randrange(0, self.dataset_size)
-            while idx_b == dataset_index:
-                idx_b = random.randrange(0, self.dataset_size)
-            seq_b, st_b = self.index_mapping[idx_b]
-            scan_b_file   = self.scan_files[seq_b][st_b]
-            label_b_file  = self.label_files[seq_b][st_b]
-
-            # light-weight load (no normals/residual/DA)
-            scan_b = SemLaserScan(self.color_map, project=True,
-                                H=self.sensor_img_H, W=self.sensor_img_W,
-                                fov_up=self.sensor_fov_up, fov_down=self.sensor_fov_down, DA=True, flip_sign=True)
-            scan_b.open_scan(scan_b_file, self.poses[seq_b][st_b], current_pose,
-                            if_transform=False)
-            scan_b.open_label(label_b_file)
-            scan_b.sem_label       = self.map(scan_b.sem_label,       self.learning_map)
-            scan_b.proj_sem_label  = self.map(scan_b.proj_sem_label,  self.learning_map)
-
-            proj_b = torch.from_numpy(scan_b.proj_range).unsqueeze(0)
-            proj_b = torch.cat([proj_b,
-                                torch.from_numpy(scan_b.proj_xyz).permute(2,0,1),
-                                torch.from_numpy(scan_b.proj_remission).unsqueeze(0)])
-            proj_b = (proj_b - self.sensor_img_means[:,None,None]) / self.sensor_img_stds[:,None,None]
-            if self.use_normal:
-                proj_b = torch.cat([proj_b,
-                                    torch.from_numpy(scan_b.normal_map).permute(2,0,1)])
-            proj_lbl_b  = torch.from_numpy(scan_b.proj_sem_label)
-            proj_msk_b  = torch.from_numpy(scan_b.proj_mask)
-            proj_b = torch.cat([proj_b, proj_msk_b.float().unsqueeze(0)])
-            return proj_b, proj_lbl_b, proj_msk_b
 
     def __getitem__(self, dataset_index):
 
@@ -291,14 +258,12 @@ class SemanticKitti(Dataset):
             rot = False
             drop_points = False
             if self.transform:
-                if random.random() >= 0:
-                    if random.random() >= 0:
-                        DA = True
-                    if random.random() >= 0:
-                        flip_sign = True
-                    if random.random() >= 0:
-                        rot = True
-                    drop_points = random.uniform(0, 0.5)
+                DA = True                         # use this for jitter (±0.3 m) if your laser scan supports it
+                rot = True                        # full 360° XY rotation
+                flip_sign = True                  # flip X / Y / both inside SemLaserScan (point-level)
+                drop_points = True if random.random() < 0.9 else 0.0  # 10% with p=0.9
+            else:
+                DA = rot = flip_sign = drop_points = False
             if self.gt:
                 scan = SemLaserScan(self.color_map,
                                     project=True,
@@ -404,78 +369,89 @@ class SemanticKitti(Dataset):
         path_split = path_norm.split(os.sep)
         path_seq = path_split[-3]
         path_name = path_split[-1].replace(".bin", ".label")
-        P_MIX, P_UNION, P_PASTE, P_SHIFT = 0.9, 0.1, 0.9, 1.0 ###
-
+        P_MIX, P_UNION, P_PASTE, P_SHIFT = 0.9, 0.2, 0.9, 1.0
+        KMIX_CHOICES = [2, 3, 4, 5, 6]
+        UNION_RATIO = 0.5  # 50% of empties
+        tail_classes = [8, 12]  # pass from cfg: x-entropy IDs of rare classes
         if self.transform:
-            # # -------- 0. sample a second scan (rv_b, rvl_b) ------------------
-            # # pick a random frame different from the current one
-            # idx_b = random.randrange(0, self.dataset_size)
-            # while idx_b == dataset_index:
-            #     idx_b = random.randrange(0, self.dataset_size)
-            # seq_b, st_b = self.index_mapping[idx_b]
-            # scan_b_file   = self.scan_files[seq_b][st_b]
-            # label_b_file  = self.label_files[seq_b][st_b]
+            # -------- sample a donor scan b --------
+            idx_b = random.randrange(0, self.dataset_size - 1)
+            if idx_b >= dataset_index:  # avoid same item
+                idx_b += 1
+            seq_b, st_b = self.index_mapping[idx_b]
+            scan_b_file  = self.scan_files[seq_b][st_b]
+            label_b_file = self.label_files[seq_b][st_b]
 
-            # # light-weight load (no normals/residual/DA)
-            # scan_b = SemLaserScan(self.color_map, project=True,
-            #                     H=self.sensor_img_H, W=self.sensor_img_W,
-            #                     fov_up=self.sensor_fov_up, fov_down=self.sensor_fov_down, DA=True, flip_sign=True)
-            # scan_b.open_scan(scan_b_file, self.poses[seq_b][st_b], current_pose,
-            #                 if_transform=False)
-            # scan_b.open_label(label_b_file)
-            # scan_b.sem_label       = self.map(scan_b.sem_label,       self.learning_map)
-            # scan_b.proj_sem_label  = self.map(scan_b.proj_sem_label,  self.learning_map)
+            scan_b = SemLaserScan(self.color_map, project=True,
+                                H=self.sensor_img_H, W=self.sensor_img_W,
+                                fov_up=self.sensor_fov_up, fov_down=self.sensor_fov_down,
+                                use_normal=self.use_normal)
+            scan_b.open_scan(scan_b_file, self.poses[seq_b][st_b], current_pose, if_transform=False)
+            scan_b.open_label(label_b_file)
+            scan_b.sem_label      = self.map(scan_b.sem_label,      self.learning_map)
+            scan_b.proj_sem_label = self.map(scan_b.proj_sem_label, self.learning_map)
 
-            # proj_b = torch.from_numpy(scan_b.proj_range).unsqueeze(0)
-            # proj_b = torch.cat([proj_b,
-            #                     torch.from_numpy(scan_b.proj_xyz).permute(2,0,1),
-            #                     torch.from_numpy(scan_b.proj_remission).unsqueeze(0)])
-            # proj_b = (proj_b - self.sensor_img_means[:,None,None]) / self.sensor_img_stds[:,None,None]
-            # if self.use_normal:
-            #     proj_b = torch.cat([proj_b,
-            #                         torch.from_numpy(scan_b.normal_map).permute(2,0,1)])
-            # proj_lbl_b  = torch.from_numpy(scan_b.proj_sem_label)
-            # proj_msk_b  = torch.from_numpy(scan_b.proj_mask)
-            # proj_b = torch.cat([proj_b, proj_msk_b.float().unsqueeze(0)])
-            C,H,W = proj_full.shape       # convenient aliases
-            proj_b, proj_lbl_b, proj_msk_b = self.sample_scan(dataset_index=dataset_index, current_pose=current_pose)
+            rv_b = torch.from_numpy(scan_b.proj_range).unsqueeze(0)
+            rv_b = torch.cat([rv_b,
+                            torch.from_numpy(scan_b.proj_xyz).permute(2,0,1),
+                            torch.from_numpy(scan_b.proj_remission).unsqueeze(0)])
+            rv_b = (rv_b - self.sensor_img_means[:,None,None]) / self.sensor_img_stds[:,None,None]
+            if self.use_normal:
+                rv_b = torch.cat([rv_b, torch.from_numpy(scan_b.normal_map).permute(2,0,1)])
 
+            msk_b = torch.from_numpy(scan_b.proj_mask).to(torch.uint8)
+            lbl_b = torch.from_numpy(scan_b.proj_sem_label).to(torch.int64)
+            rv_b  = torch.cat([rv_b, msk_b.float().unsqueeze(0)])
+
+            C, H, W = proj_full.shape
+
+            # -------- 1) RangeMix (tile/stripe mixing) --------
             if random.random() < P_MIX:
-                # -------- 1. RangeMix  ------------------------------------------
-                #proj_b, proj_lbl_b, proj_msk_b = self.sample_scan(dataset_index=dataset_index, current_pose=current_pose)
-                k_choices = [2, 3, 4, 5, 6]
-                phi, theta = random.sample(k_choices, 2)   # guarantees ϕ ≠ θ
-                ph, pw = H//phi, W//theta
-                for i in range(ph, H+1, ph):
-                    for j in range(pw, W+1, pw):
-                        proj_full[:, i-ph:i, j-pw:j] = proj_b[:, i-ph:i, j-pw:j]
-                        proj_labels[   i-ph:i, j-pw:j] = proj_lbl_b[ i-ph:i, j-pw:j]
-                        #proj_mask  [   i-ph:i, j-pw:j] = proj_msk_b[ i-ph:i, j-pw:j]
+                phi = random.choice(KMIX_CHOICES)        # stripes in elevation
+                theta = random.choice(KMIX_CHOICES)      # stripes in azimuth
+                ph, pw = H // phi, W // theta
+                # mix alternating tiles taken from donor
+                take_from_b = True
+                for i in range(0, H, ph if ph > 0 else H):
+                    for j in range(0, W, pw if pw > 0 else W):
+                        i2 = min(i + (ph if ph > 0 else H), H)
+                        j2 = min(j + (pw if pw > 0 else W), W)
+                        if take_from_b:
+                            proj_full[:, i:i2, j:j2] = rv_b[:, i:i2, j:j2]
+                            proj_labels[i:i2, j:j2]  = lbl_b[i:i2, j:j2]
+                            proj_mask[i:i2, j:j2]    = msk_b[i:i2, j:j2]
+                        take_from_b = not take_from_b
+
+            # -------- 2) RangeUnion (fill 50% of empties) --------
             if random.random() < P_UNION:
-                # -------- 2. RangeUnion (fill void cells) ------------------------
-                #proj_b, proj_lbl_b, proj_msk_b = self.sample_scan(dataset_index=dataset_index, current_pose=current_pose)
-                void = (proj_mask == 0)
-                # idx = void.nonzero(as_tuple=False)
-                # k = int(0.5 * idx.shape[0])
-                # sel = idx[torch.randperm(idx.shape[0])[:k]]
-                # proj_full[:, sel[:,0], sel[:,1]] = proj_b[:, sel[:,0], sel[:,1]]
-                # proj_labels[sel[:,0], sel[:,1]] = proj_lbl_b[sel[:,0], sel[:,1]]
-                proj_full[:, void] = proj_b[:, void]
-                proj_labels[void]  = proj_lbl_b[void]
-                proj_mask[void]    = proj_msk_b[void]
+                void = (proj_mask == 0) & (msk_b == 1)                 # candidates we can actually fill
+                if void.any():
+                    candidate_idxs = void.nonzero(as_tuple=False)
+                    k = int(candidate_idxs.size(0) * UNION_RATIO)
+                    if k > 0:
+                        sel = candidate_idxs[torch.randperm(candidate_idxs.size(0))[:k]]
+                        proj_full[:, sel[:,0], sel[:,1]] = rv_b[:, sel[:,0], sel[:,1]]
+                        proj_labels[sel[:,0], sel[:,1]]  = lbl_b[sel[:,0], sel[:,1]]
+                        proj_mask[sel[:,0], sel[:,1]]    = 1
+
+            # -------- 3) RangePaste (rare-class copy-paste) --------
             if random.random() < P_PASTE:
-                # -------- 3. RangePaste (rare-class copy-paste) ------------------
-                #proj_b, proj_lbl_b, proj_msk_b = self.sample_scan(dataset_index=dataset_index, current_pose=current_pose)
-                for cls in self.upsample_classes:          
-                    pix = (proj_lbl_b == cls)
-                    proj_full[:, pix] = proj_b[:, pix]
-                    proj_labels[pix]  = cls
-                    #proj_mask[pix]    = 1
-            # -------- 4. RangeShift (azimuthal roll) -------------------------
-            k = random.randint(W//4, int(0.75*W))
-            proj_full  = torch.cat((proj_full[..., k:],  proj_full[..., :k]),  dim=2)
-            proj_labels= torch.cat((proj_labels[:, k:], proj_labels[:, :k]),   dim=1)
-            #proj_mask  = torch.cat((proj_mask[:, k:],   proj_mask[:, :k]),     dim=1)
+                # allow user/config to provide tail list; otherwise, build a small default
+                paste_classes = tail_classes if tail_classes is not None else []
+                if paste_classes:
+                    for cls in paste_classes:
+                        pix = (lbl_b == int(cls)) & (msk_b == 1)
+                        if pix.any():
+                            proj_full[:, pix] = rv_b[:, pix]
+                            proj_labels[pix]  = int(cls)
+                            proj_mask[pix]    = 1
+
+            # -------- 4) RangeShift (azimuthal roll; always on) --------
+            if P_SHIFT > 0:
+                k = random.randint(W // 4, int(0.75 * W))
+                proj_full   = torch.roll(proj_full,  shifts=k, dims=2)   # C,H,W
+                proj_labels = torch.roll(proj_labels,shifts=k, dims=1)   # H,W
+                proj_mask   = torch.roll(proj_mask,  shifts=k, dims=1)   # H,W
 
         #proj_full = proj_full * proj_mask.float()
         ### A simple version Cutline operation by JiadaiSun ###
