@@ -92,7 +92,7 @@ class SemanticKitti(Dataset):
         self.max_points = max_points
         self.gt = gt
         self.transform = transform
-        self.upsample_classes = {8, 12}
+        self.upsample_classes = {4, 5, 8, 12}
 
 
         """
@@ -237,11 +237,9 @@ class SemanticKitti(Dataset):
             seq_b, st_b = self.index_mapping[idx_b]
             scan_b_file   = self.scan_files[seq_b][st_b]
             label_b_file  = self.label_files[seq_b][st_b]
-
-            # light-weight load (no normals/residual/DA)
             scan_b = SemLaserScan(self.color_map, project=True,
                                 H=self.sensor_img_H, W=self.sensor_img_W,
-                                fov_up=self.sensor_fov_up, fov_down=self.sensor_fov_down, DA=True, flip_sign=True)
+                                fov_up=self.sensor_fov_up, fov_down=self.sensor_fov_down, DA=True, flip_sign=True, rot=True, drop_points=0.1, use_normal=False)
             scan_b.open_scan(scan_b_file, self.poses[seq_b][st_b], current_pose,
                             if_transform=False)
             scan_b.open_label(label_b_file)
@@ -291,14 +289,11 @@ class SemanticKitti(Dataset):
             rot = False
             drop_points = False
             if self.transform:
-                if random.random() >= 0:
-                    if random.random() >= 0:
-                        DA = True
-                    if random.random() >= 0:
-                        flip_sign = True
-                    if random.random() >= 0:
-                        rot = True
-                    drop_points = random.uniform(0, 0.5)
+                DA = True
+                flip_sign = True
+                rot = True
+                if random.random() < 0.9:
+                    drop_points = 0.10
             if self.gt:
                 scan = SemLaserScan(self.color_map,
                                     project=True,
@@ -308,6 +303,7 @@ class SemanticKitti(Dataset):
                                     fov_down=self.sensor_fov_down,
                                     DA=DA,
                                     flip_sign=flip_sign,
+                                    rot=rot,
                                     drop_points=drop_points,
                                     use_normal=self.use_normal)
             else:
@@ -404,39 +400,12 @@ class SemanticKitti(Dataset):
         path_split = path_norm.split(os.sep)
         path_seq = path_split[-3]
         path_name = path_split[-1].replace(".bin", ".label")
-        P_MIX, P_UNION, P_PASTE, P_SHIFT = 0.9, 0.1, 0.9, 1.0 ###
+        
+        
+        
+        P_MIX, P_UNION, P_PASTE, P_SHIFT = 0.9, 0.2, 0.9, 1.0 ###
 
         if self.transform:
-            # # -------- 0. sample a second scan (rv_b, rvl_b) ------------------
-            # # pick a random frame different from the current one
-            # idx_b = random.randrange(0, self.dataset_size)
-            # while idx_b == dataset_index:
-            #     idx_b = random.randrange(0, self.dataset_size)
-            # seq_b, st_b = self.index_mapping[idx_b]
-            # scan_b_file   = self.scan_files[seq_b][st_b]
-            # label_b_file  = self.label_files[seq_b][st_b]
-
-            # # light-weight load (no normals/residual/DA)
-            # scan_b = SemLaserScan(self.color_map, project=True,
-            #                     H=self.sensor_img_H, W=self.sensor_img_W,
-            #                     fov_up=self.sensor_fov_up, fov_down=self.sensor_fov_down, DA=True, flip_sign=True)
-            # scan_b.open_scan(scan_b_file, self.poses[seq_b][st_b], current_pose,
-            #                 if_transform=False)
-            # scan_b.open_label(label_b_file)
-            # scan_b.sem_label       = self.map(scan_b.sem_label,       self.learning_map)
-            # scan_b.proj_sem_label  = self.map(scan_b.proj_sem_label,  self.learning_map)
-
-            # proj_b = torch.from_numpy(scan_b.proj_range).unsqueeze(0)
-            # proj_b = torch.cat([proj_b,
-            #                     torch.from_numpy(scan_b.proj_xyz).permute(2,0,1),
-            #                     torch.from_numpy(scan_b.proj_remission).unsqueeze(0)])
-            # proj_b = (proj_b - self.sensor_img_means[:,None,None]) / self.sensor_img_stds[:,None,None]
-            # if self.use_normal:
-            #     proj_b = torch.cat([proj_b,
-            #                         torch.from_numpy(scan_b.normal_map).permute(2,0,1)])
-            # proj_lbl_b  = torch.from_numpy(scan_b.proj_sem_label)
-            # proj_msk_b  = torch.from_numpy(scan_b.proj_mask)
-            # proj_b = torch.cat([proj_b, proj_msk_b.float().unsqueeze(0)])
             C,H,W = proj_full.shape       # convenient aliases
             proj_b, proj_lbl_b, proj_msk_b = self.sample_scan(dataset_index=dataset_index, current_pose=current_pose)
 
@@ -446,23 +415,20 @@ class SemanticKitti(Dataset):
                 k_choices = [2, 3, 4, 5, 6]
                 phi, theta = random.sample(k_choices, 2)   # guarantees ϕ ≠ θ
                 ph, pw = H//phi, W//theta
-                for i in range(ph, H+1, ph):
-                    for j in range(pw, W+1, pw):
-                        proj_full[:, i-ph:i, j-pw:j] = proj_b[:, i-ph:i, j-pw:j]
-                        proj_labels[   i-ph:i, j-pw:j] = proj_lbl_b[ i-ph:i, j-pw:j]
-                        #proj_mask  [   i-ph:i, j-pw:j] = proj_msk_b[ i-ph:i, j-pw:j]
+                for i in range(1, ph):
+                    for j in range(1, pw):
+                        proj_full[:, i-1:i, j-1:j] = proj_b[:, i-1:i, j-1:j]
+                        proj_labels[   i-1:i, j-1:j] = proj_lbl_b[ i-1:i, j-1:j]
+                        # proj_mask  [   i-1:i, j-1:j] = proj_msk_b[ i-1:i, j-1:j]
             if random.random() < P_UNION:
                 # -------- 2. RangeUnion (fill void cells) ------------------------
                 #proj_b, proj_lbl_b, proj_msk_b = self.sample_scan(dataset_index=dataset_index, current_pose=current_pose)
                 void = (proj_mask == 0)
-                # idx = void.nonzero(as_tuple=False)
-                # k = int(0.5 * idx.shape[0])
-                # sel = idx[torch.randperm(idx.shape[0])[:k]]
-                # proj_full[:, sel[:,0], sel[:,1]] = proj_b[:, sel[:,0], sel[:,1]]
-                # proj_labels[sel[:,0], sel[:,1]] = proj_lbl_b[sel[:,0], sel[:,1]]
-                proj_full[:, void] = proj_b[:, void]
-                proj_labels[void]  = proj_lbl_b[void]
-                proj_mask[void]    = proj_msk_b[void]
+                donor_valid = (proj_msk_b > 0)
+                fill_mask = void & donor_valid & (torch.rand_like(proj_mask, dtype=torch.float32) < 0.5)
+                proj_full[:, fill_mask] = proj_b[:, fill_mask]
+                proj_labels[fill_mask]  = proj_lbl_b[fill_mask]
+                # proj_mask[fill_mask]    = proj_msk_b[fill_mask]
             if random.random() < P_PASTE:
                 # -------- 3. RangePaste (rare-class copy-paste) ------------------
                 #proj_b, proj_lbl_b, proj_msk_b = self.sample_scan(dataset_index=dataset_index, current_pose=current_pose)
@@ -476,6 +442,8 @@ class SemanticKitti(Dataset):
             proj_full  = torch.cat((proj_full[..., k:],  proj_full[..., :k]),  dim=2)
             proj_labels= torch.cat((proj_labels[:, k:], proj_labels[:, :k]),   dim=1)
             #proj_mask  = torch.cat((proj_mask[:, k:],   proj_mask[:, :k]),     dim=1)
+
+
 
         #proj_full = proj_full * proj_mask.float()
         ### A simple version Cutline operation by JiadaiSun ###

@@ -5,7 +5,7 @@ from sam2.build_sam import build_sam2
 from utils.RSAMUtils import *
 
 class RSAMRFEncoder(nn.Module):
-    def __init__(self,model_cfg, checkpoint_path=None, stem="rangeformer", freeze_weight=True, adapter=True, msca=True, pos_emb=True) -> None:
+    def __init__(self,model_cfg, checkpoint_path=None, freeze_weight=True, adapter=True, msca=True, pos_emb=True) -> None:
         super(RSAMRFEncoder, self).__init__()
         model = build_sam2(model_cfg, checkpoint_path)
         del model.sam_mask_decoder
@@ -17,7 +17,7 @@ class RSAMRFEncoder(nn.Module):
         del model.obj_ptr_proj
         del model.image_encoder.neck
         self.backbone = model.image_encoder.trunk
-        self.pos_emb = pos_emb
+        self.pos_emb = True
         del self.backbone.pos_embed
         del self.backbone.pos_embed_window
         self.stem = self.backbone.patch_embed.proj
@@ -25,32 +25,33 @@ class RSAMRFEncoder(nn.Module):
         del self.backbone.patch_embed.proj
         self.stem = nn.Sequential(
             nn.Linear(6, out_channels//4),
-            nn.LayerNorm(out_channels//4),
+            # nn.LayerNorm(out_channels//4),
             nn.GELU(),
             nn.Linear(out_channels//4, out_channels//2),
-            nn.LayerNorm(out_channels//2),
+            # nn.LayerNorm(out_channels//2),
             nn.GELU(),
             nn.Linear(out_channels//2, out_channels),
-            nn.LayerNorm(out_channels),
+            # nn.LayerNorm(out_channels),
             nn.GELU(),
+            nn.LayerNorm(out_channels),
         ) 
         self.patch_embed = nn.Conv2d(out_channels*1, out_channels*1, kernel_size=7, padding=3)
-        if freeze_weight:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
+        # if freeze_weight:
+        #     for param in self.backbone.parameters():
+        #         param.requires_grad = False
         adapted_blocks = nn.ModuleList()
         for block in self.backbone.blocks:
             adapted_blocks.append(
                 BestAdapter(block)
             )
         self.backbone.blocks = adapted_blocks
-        if self.pos_emb:
-            self.pos_embed = nn.Parameter(
-                torch.zeros(1, out_channels, 4, 128)
-            )
-            self.pos_embed_window = nn.Parameter(
-                torch.zeros(1, out_channels, 4, 32)
-            )
+        # if self.pos_emb:
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, out_channels, 4, 128)
+        )
+        self.pos_embed_window = nn.Parameter(
+            torch.zeros(1, out_channels, 4, 32)
+        )
     def _get_pos_embed(self, hw) -> torch.Tensor:
         h, w = hw
         window_embed = self.pos_embed_window
@@ -68,8 +69,8 @@ class RSAMRFEncoder(nn.Module):
         x = x.permute(0, 3, 1, 2)
         x = self.patch_embed(x)
         x = x.permute(0, 2, 3, 1)
-        if (self.pos_emb):
-            x = x + self._get_pos_embed(x.shape[1:3])
+        # if (self.pos_emb):
+        x = x + self._get_pos_embed(x.shape[1:3])
         for i, blk in enumerate(self.backbone.blocks):
             x = blk(x)
             if i in self.backbone.stage_ends:
@@ -93,7 +94,6 @@ class RSAMDecoder(nn.Module):
             self.conv4 = nn.Conv2d(out_channels*8, unify_dim, kernel_size=1)
         self.main_head = nn.Sequential(
             nn.Linear(unify_dim*4, unify_dim),
-            nn.LayerNorm(unify_dim),
             nn.GELU(),
             nn.Linear(unify_dim, 20, 1),
         )
@@ -119,14 +119,14 @@ class RSAMDecoder(nn.Module):
     
 
 class SAM2UNet(nn.Module):
-    def __init__(self,model_cfg, checkpoint_path=None, stem="rangeformer", freeze_weight=False, adapter=False, msca=False, unify_dim=256, use_rfb=True, pos_emb=True) -> None:
+    def __init__(self,model_cfg, checkpoint_path=None, freeze_weight=False, adapter=False, msca=False, unify_dim=256, use_rfb=True, pos_emb=True) -> None:
         super(SAM2UNet, self).__init__()
         # if any(x in model_cfg for x in ["_s", "_t"]):
         #     out_channels = 96
         # elif any(x in model_cfg for x in ["_l", "_b+"]):
         #     out_channels = 144
         out_channels = 96
-        self.encoder = RSAMRFEncoder(model_cfg=model_cfg, checkpoint_path=checkpoint_path, stem=stem,
+        self.encoder = RSAMRFEncoder(model_cfg=model_cfg, checkpoint_path=checkpoint_path,
                                 freeze_weight=freeze_weight, adapter=adapter, msca=msca, pos_emb=pos_emb)
         self.decoder = RSAMDecoder(out_channels=out_channels, unify_dim=unify_dim, use_rfb=use_rfb)
 

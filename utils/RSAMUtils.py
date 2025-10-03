@@ -420,15 +420,15 @@ class BasicConv2d(nn.Module):
         self.conv = nn.Conv2d(in_planes, out_planes,
                               kernel_size=kernel_size, stride=stride,
                               padding=padding, dilation=dilation, groups=groups, bias=False)
-        self.ln = nn.LayerNorm(out_planes)
+        # self.ln = nn.LayerNorm(out_planes)
+        self.norm = nn.GroupNorm(num_groups=out_planes//16, num_channels=out_planes)
         self.act = nn.GELU()
 
     def forward(self, x):
         x = self.conv(x)
-        x = x.permute(0, 2, 3, 1)
-        x = self.ln(x)
-        x = self.act(x)
-        return x.permute(0, 3, 1, 2)
+        #x = x.permute(0, 2, 3, 1)
+        x = self.norm(x)
+        return x#.permute(0, 3, 1, 2)
 
 
 class RFB_modified(nn.Module):

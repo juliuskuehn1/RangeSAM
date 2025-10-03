@@ -155,12 +155,25 @@ class LaserScan:
             jitter = np.random.normal(0.0, r_j, 3).astype(np.float32)
             np.clip(jitter, -3*r_j, 3*r_j, out=jitter)
             self.points += jitter
+        # (5) Random Dropping (rate passed in; applied with p=0.9 in caller)
+        # self.points_to_drop = None
+        # drop_points = 0.1
+        # if self.drop_points:
+        #     max_drop = int(len(self.points) * float(drop_points))
+        #     drop = np.random.randint(0, max_drop + 1) if max_drop > 0 else 0
+        #     if drop > 0:
+        #         to_drop = np.random.randint(0, len(self.points), size=drop)
+        #         to_drop = np.unique(to_drop)
+        #         self.points = np.delete(self.points, to_drop, axis=0)
+        #         if remissions is not None:
+        #             remissions = np.delete(remissions, to_drop)
+        #         self.points_to_drop = to_drop  # used by SemLaserScan.open_label
         # Global rotation
         if self.rot:
             ang = np.random.uniform(0.0, 2.0 * np.pi)
             c, s = np.cos(ang), np.sin(ang)
             rot2 = np.array([[c, s], [-s, c]], dtype=np.float32)
-            self.points[:, :2] = self.points[:, :2].dot(rot2) ##
+            self.points[:, :2] = self.points[:, :2].dot(rot2)
             
         if remissions is not None:
             self.remissions = remissions  # get remission
@@ -324,9 +337,9 @@ class SemLaserScan(LaserScan):
 
     def __init__(self, sem_color_dict=None, project=False,
                 H=64, W=1024, fov_up=3.0, fov_down=-25.0, max_classes=300,
-                DA=False, flip_sign=False, rot = False, drop_points=False, use_normal=False):
+                DA=False, flip_sign=False, drop_points=False, use_normal=False):
         super(SemLaserScan, self).__init__(project, H, W, fov_up, fov_down, DA=DA,
-                                        flip_sign=flip_sign, rot=rot, drop_points=drop_points, use_normal=use_normal)
+                                        flip_sign=flip_sign, drop_points=drop_points, use_normal=use_normal)
         self.reset()
 
         # make semantic colors

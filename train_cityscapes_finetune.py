@@ -488,10 +488,13 @@ def load_ported_weights(new_model, old_ckpt_path, verbose=True):
     drop_prefixes = (
         'encoder.stem.',          # old/new stems incompatible
         'encoder.patch_embed.',   # changed
-        'decoder.',               # changed decoder
     )
-
+    decoder_keep = ('decoder.rfb1.', 'decoder.rfb2.', 'decoder.rfb3.', 'decoder.rfb4.')
     for k, v in old_sd.items():
+        if k.startswith('decoder.'):
+            if not k.startswith(decoder_keep):
+                skipped.append(k)
+                continue
         if k.startswith(drop_prefixes):
             skipped.append(k)
             continue

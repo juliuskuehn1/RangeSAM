@@ -18,6 +18,8 @@ from RSAMconv import SAM2UNet
 from preprocess.parser import Parser, SemanticKitti
 from utils.utils import *
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from torch.optim.lr_scheduler import OneCycleLR
+
 from schedulefree import AdamWScheduleFree
 
 torch.set_float32_matmul_precision('high')
@@ -280,13 +282,14 @@ def combined_loss(logits, mask, num_classes=20,
    259.369873,   # 18: pole
    618.966736    # 19: traffic-sign
     ], dtype=torch.float32, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+    w_c = w_c/w_c.mean()
     w_c = w_c.to(logits.dtype)
     ce = F.cross_entropy(logits, mask,
                          weight=w_c,
                          ignore_index=0,
                          reduction='mean')
     # ce = focal_cross_entropy(logits=logits, mask=mask, gamma=2, alpha=w_c, ignore_index=0)
-    # 2) Dice
+    # 2) Dice #
     d = dice_loss(logits, mask, ignore_index=0)
     # 3) Lovasz
     l  = lovasz_softmax(logits, mask, ignore_index=0)
@@ -358,14 +361,6 @@ def evaluate_metrics_ddp(model,
     """
     Computes pixel-accuracy, mean-accuracy, mIoU and fwIoU on the *full*
     validation set in a DDP run.
-
-    • Each rank accumulates its local confusion-matrix.  
-    • `dist.all_reduce` sums those matrices across ranks.  
-    • Rank 0 returns/prints the metrics (others still return a dict so the
-      call is symmetric).
-
-    NOTE: the DataLoader may still use DistributedSampler; that is fine as
-    long as we aggregate here.
     """
     if device is None:
         device = next(model.parameters()).device
@@ -406,10 +401,9 @@ def evaluate_metrics_ddp(model,
         if cls == ignore_index:
             continue
         gt = conf[cls].sum().item()
-        if gt:
-            class_acc.append(conf[cls, cls].item() / gt)
-
         tp = conf[cls, cls].item()
+        if gt:
+            class_acc.append(tp / gt)
         fp = conf[:, cls].sum().item() - tp
         fn = conf[cls, :].sum().item() - tp
         denom = tp + fp + fn
@@ -511,29 +505,33 @@ def load_ported_weights(new_model, old_ckpt_path, verbose=True):
 
     # keys to drop (anything you replaced)
     drop_prefixes = (
-        'decoder.main_head',     # e.g. decoder.main_head.0.weight
-        'decoder.aux_heads',     # e.g. decoder.aux_heads.0.weight
+        'encoder.stem.',          # old/new stems incompatible
+        'encoder.patch_embed.',   # changed
     )
-
+    decoder_keep = ('decoder.rfb1.', 'decoder.rfb2.', 'decoder.rfb3.', 'decoder.rfb4.')
     for k, v in old_sd.items():
+        if k.startswith('decoder.'):
+            if not k.startswith(decoder_keep):
+                skipped.append(k)
+                continue
         if k.startswith(drop_prefixes):
             skipped.append(k)
             continue
-        # only take tensors that exist in new model with identical shape
         if k in new_sd and new_sd[k].shape == v.shape:
             transfer[k] = v
         else:
             mismatched.append(k)
 
-    # load only the transferred weights; leave everything else as-is
-    missing, unexpected = new_model.load_state_dict(transfer, strict=False)
+    # update new model's state dict and load
+    new_sd.update(transfer)
+    missing, unexpected = new_model.load_state_dict(new_sd, strict=False)
 
     if verbose:
         print(f'Loaded {len(transfer)} tensors from old checkpoint.')
         if skipped:
-            print(f'Skipped (by design): {len(skipped)} e.g.: {skipped[:5]}')
+            print(f'Skipped (by design): {len(skipped)} tensors, e.g.: {skipped[:5]}')
         if mismatched:
-            print(f'Shape-mismatched (not loaded): {len(mismatched)} e.g.: {mismatched[:5]}')
+            print(f'Shape-mismatched (not loaded): {len(mismatched)} tensors, e.g.: {mismatched[:5]}')
         if missing:
             print(f'Missing in checkpoint (expected by new model): {len(missing)} e.g.: {missing[:5]}')
         if unexpected:
@@ -549,7 +547,6 @@ def train(rank, args):
     model = SAM2UNet(
         "sam2.1_hiera_t.yaml",
         "sam2.1_hiera_tiny.pt",
-        stem=args.stem,
         freeze_weight=args.freeze_weight,
         adapter=args.adapter,
         msca=args.msca,
@@ -559,7 +556,8 @@ def train(rank, args):
     ).to(device)
     total = sum(p.numel() for p in model.parameters())
     print(f"Total number of parameters: {total:,}")
-    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    model = load_ported_weights(model, "./data/epoch19.pth", verbose=True)
+    # model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = torch.nn.parallel.DistributedDataParallel(
         model,
         device_ids=[rank]
@@ -571,13 +569,17 @@ def train(rank, args):
         if not p.requires_grad:
             continue
         # 1) pos-embeddings of the backbone → other_params
-        if "encoder.backbone" in n and "pos_embed" in n:
+        if n.startswith("encoder.pos_embed") or n.startswith("encoder.pos_embed_window"):
             other_params.append(p)
 
         # 2) remaining backbone weights → backbone_params
-        elif "encoder.backbone" in n:
-            backbone_params.append(p)
-
+        if n.startswith("encoder.backbone"):
+            if ".block." in n:
+                backbone_params.append(p)     # lower LR
+            else:
+                # adapter pieces: dwconv / linear / act, plus any non-.block backbone buffers you keep
+                other_params.append(p)      # main LR
+            continue
         # 3) everything else → other_params
         else:
             other_params.append(p)
@@ -585,17 +587,34 @@ def train(rank, args):
     # assert backbone_params, "didn't catch any backbone parameters — check the name!"
     # assert other_params,    "everything landed in the backbone group?"
     optimizer = optim.AdamW(
-    [
-        {"params": other_params,    "lr": args.lr},   # heads, adapters, decoder
-        {"params": backbone_params, "lr": args.backbone_lr},   # fine‑tune SAM2 trunk
-    ],
-        weight_decay=args.weight_decay,
+        [
+            {
+                "params": other_params,
+                "lr": args.lr,
+                "weight_decay": args.weight_decay,     # e.g. 1e-2
+            },
+            {
+                "params": backbone_params,
+                "lr": args.backbone_lr,
+                "weight_decay": args.weight_decay // 10,      # e.g. smaller or 0##
+            },
+        ]
     )
+    # optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     steps_per_epoch = len(train_loader)            # batches per epoch on this GPU
     warmup_epochs   = args.warmup_epochs
     warmup_steps    = warmup_epochs * steps_per_epoch
     total_steps     = args.epochs * steps_per_epoch
-    
+    # scheduler = OneCycleLR(
+    #     optimizer,
+    #     max_lr=args.lr,                # peak LR
+    #     epochs=args.epochs,                 # total number of epochs
+    #     steps_per_epoch=len(train_loader),
+    #     pct_start=0.3,             # % of steps to increase LR
+    #     anneal_strategy="cos",     # or "linear"
+    #     base_momentum=0.85,
+    #     max_momentum=0.95,
+    # ) ###
     warmup_scheduler = LinearLR(
         optimizer,
         start_factor=args.warmup_start_factor,     # e.g. 0.1
@@ -612,7 +631,7 @@ def train(rank, args):
     scheduler = SequentialLR(
         optimizer,
         schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[warmup_steps],                 # switch after warm-up
+        milestones=[warmup_steps],                 # switch after warm-up #
     )
     
     mIoU = 0
@@ -655,10 +674,11 @@ def train(rank, args):
                     print(f"  Class {cls:2d}: {iou:.4f}")
                 if metrics['miou'] > mIoU:
                     print("New best mIoU!")
-                    ckpt = os.path.join(args.save_path, f'SAM2-UNet-epoch{epoch}-rank{rank}.pth')
                     mIoU = metrics['miou']
-                    torch.save(model.module.state_dict(), ckpt)
-                    print(f"[Saved Snapshot:] {ckpt}")
+                ckpt = os.path.join(args.save_path, f'SAM2-UNet-epoch{epoch}-rank{rank}.pth')
+                # mIoU = metrics['miou']
+                torch.save(model.module.state_dict(), ckpt)
+                print(f"[Saved Snapshot:] {ckpt}")
     cleanup_ddp()
 
 if __name__ == "__main__":

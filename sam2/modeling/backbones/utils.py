@@ -25,7 +25,7 @@ def window_partition(x, window_size):
     """
     B, H, W, C = x.shape
     window_h = window_size
-    window_w = window_size * 8
+    window_w = window_size * 16
     pad_h = (window_h - H % window_h) % window_h
     pad_w = (window_w - W % window_w) % window_w
     if pad_h > 0 or pad_w > 0:
@@ -49,7 +49,7 @@ def window_unpartition(windows, window_size, pad_hw, hw):
         x: unpartitioned sequences with [B, H, W, C].
     """
     window_h = window_size
-    window_w = window_size * 8 ###
+    window_w = window_size * 16 ###
     Hp, Wp = pad_hw
     H, W = hw
     B = windows.shape[0] // (Hp * Wp // window_h // window_w)
