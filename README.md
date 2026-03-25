@@ -1,22 +1,304 @@
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/sam2-unet-segment-anything-2-makes-strong/salient-object-detection-on-duts-te-1)](https://paperswithcode.com/sota/salient-object-detection-on-duts-te-1?p=sam2-unet-segment-anything-2-makes-strong)
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/sam2-unet-segment-anything-2-makes-strong/salient-object-detection-on-dut-omron-2)](https://paperswithcode.com/sota/salient-object-detection-on-dut-omron-2?p=sam2-unet-segment-anything-2-makes-strong)
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/sam2-unet-segment-anything-2-makes-strong/salient-object-detection-on-hku-is-1)](https://paperswithcode.com/sota/salient-object-detection-on-hku-is-1?p=sam2-unet-segment-anything-2-makes-strong)
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/sam2-unet-segment-anything-2-makes-strong/salient-object-detection-on-pascal-s-1)](https://paperswithcode.com/sota/salient-object-detection-on-pascal-s-1?p=sam2-unet-segment-anything-2-makes-strong)
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/sam2-unet-segment-anything-2-makes-strong/salient-object-detection-on-ecssd-1)](https://paperswithcode.com/sota/salient-object-detection-on-ecssd-1?p=sam2-unet-segment-anything-2-makes-strong)
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/sam2-unet-segment-anything-2-makes-strong/image-segmentation-on-mas3k)](https://paperswithcode.com/sota/image-segmentation-on-mas3k?p=sam2-unet-segment-anything-2-makes-strong)
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/sam2-unet-segment-anything-2-makes-strong/image-segmentation-on-rmas)](https://paperswithcode.com/sota/image-segmentation-on-rmas?p=sam2-unet-segment-anything-2-makes-strong)
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/sam2-unet-segment-anything-2-makes-strong/image-segmentation-on-msd-mirror-segmentation)](https://paperswithcode.com/sota/image-segmentation-on-msd-mirror-segmentation?p=sam2-unet-segment-anything-2-makes-strong)
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/sam2-unet-segment-anything-2-makes-strong/image-segmentation-on-pmd)](https://paperswithcode.com/sota/image-segmentation-on-pmd?p=sam2-unet-segment-anything-2-makes-strong)
+# RangeSAM
 
-## [SAM2-UNet: Segment Anything 2 Makes Strong Encoder for Natural and Medical Image Segmentation](https://arxiv.org/abs/2408.08870)
-Xinyu Xiong, Zihuang Wu, Shuangyi Tan, Wenxue Li, Feilong Tang, Ying Chen, Siying Li, Jie Ma, Guanbin Li
+RangeSAM is a research codebase for studying how visual foundation models, in particular SAM 2 style backbones, transfer to range-view LiDAR semantic segmentation. The repository contains model variants, preprocessing utilities, training and evaluation scripts, checkpoint download helpers, and dataset conversion tools for range-view experiments.
 
-## Introduction
-![framework](./sam2unet.jpg)Image segmentation plays an important role in vision understanding. Recently, the emerging vision foundation models continuously achieved superior performance on various tasks. Following such success, in this paper, we prove that the Segment Anything Model 2 (SAM2) can be a strong encoder for U-shaped segmentation models. We propose a simple but effective framework, termed SAM2-UNet, for versatile image segmentation. Specifically, SAM2-UNet adopts the Hiera backbone of SAM2 as the encoder, while the decoder uses the classic U-shaped design. Additionally, adapters are inserted into the encoder to allow parameter-efficient fine-tuning. Preliminary experiments on various downstream tasks, such as camouflaged object detection, salient object detection, marine animal segmentation, mirror detection, and polyp segmentation, demonstrate that our SAM2-UNet can simply beat existing specialized state-of-the-art methods without bells and whistles.
+This work was presented at the WACV 2026 Foundational Models Beyond the Visual Spectrum (FoMoV) Workshop.
 
-[微信交流群](./wechat0423.jpg)
+Paper:
+https://openaccess.thecvf.com/content/WACV2026W/FoMoV/html/Kuhn_RangeSAM_On_the_Potential_of_Visual_Foundation_Models_for_Range-View_WACVW_2026_paper.html
 
-## Clone Repository
+## What Is In This Repository
+
+- Range-view segmentation models and experiments, including RangeSAM variants and SAM-based architectures.
+- Training scripts for SemanticKITTI-focused experiments, plus additional scripts for nuScenes and Cityscapes variants.
+- Preprocessing tools for range projection and offline cache generation.
+- A vendored SAM 2 codebase under `sam2/` and reference material under `sam2-files/`.
+- Utilities for checkpoint download, visualization, verification, and evaluation.
+
+## Recommended Environment
+
+The repository is primarily set up for Linux with Python 3.10 and a CUDA-capable GPU.
+
+Recommended baseline:
+
+- Linux
+- Python 3.10
+- NVIDIA GPU with recent CUDA drivers
+- `git`, `build-essential`, and `cmake`
+- `nvcc` only if you want to build the optional SAM 2 CUDA extension locally
+
+Notes:
+
+- The project can still be installed when the SAM 2 CUDA extension cannot be compiled.
+- If you do not have a local CUDA toolkit, disable the extension build explicitly during installation.
+- Several scripts are research variants and assume specific dataset locations or experiment settings. Installation is stable; runtime configuration still requires choosing the script that matches your experiment.
+
+## Installation
+
+### 1. Clone the repository
+
+```bash
+git clone <your-repo-url>
+cd pointcloud-segmentation
+```
+
+### 2. Create and activate a Python environment
+
+Using `venv`:
+
+```bash
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+```
+
+Using Conda:
+
+```bash
+conda create -n rangesam python=3.10 -y
+conda activate rangesam
+python -m pip install --upgrade pip setuptools wheel
+```
+
+### 3. Install PyTorch
+
+Install a PyTorch build that matches your system. The repository currently targets CUDA 12.1 wheels in `requirements.txt`.
+
+Example for CUDA 12.1:
+
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
+
+Example for CPU-only:
+
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+```
+
+### 4. Install Python dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 5. Install the repository in editable mode
+
+If you have a local CUDA toolkit and want the optional SAM 2 extension build:
+
+```bash
+SAM2_BUILD_ALLOW_ERRORS=1 pip install -e .
+```
+
+If you do not have `nvcc` or do not want to build the extension:
+
+```bash
+SAM2_BUILD_CUDA=0 pip install -e .
+```
+
+Why both `requirements.txt` and `pip install -e .` are used:
+
+- `requirements.txt` installs the broader experiment dependencies used by this repository.
+- `pip install -e .` registers the local code and the vendored `sam2` package so imports resolve correctly.
+
+### 6. Verify the installation
+
+```bash
+python -c "import torch; import sam2; print('torch', torch.__version__)"
+```
+
+If you also want to verify that the project modules import:
+
+```bash
+python -c "from SAM2UNet import SAM2UNet; print('RangeSAM imports OK')"
+```
+
+## Checkpoints
+
+**Important:** Checkpoints are not included in this repository due to GitHub's file size limits. You must download them before training or inference.
+
+The repository provides a helper script to download SAM 2.1 checkpoints. Create a checkpoint directory and run the download script from inside it:
+
+```bash
+mkdir -p checkpoints
+cd checkpoints
+../download_ckpts.sh
+cd ..
+```
+
+This will download and place files such as:
+
+- `checkpoints/sam2.1_hiera_tiny.pt`
+- `checkpoints/sam2.1_hiera_small.pt`
+- `checkpoints/sam2.1_hiera_base_plus.pt`
+- `checkpoints/sam2.1_hiera_large.pt`
+
+This is required because several training and inference scripts assume checkpoint paths under `checkpoints/`. Without running the download script, training and evaluation will fail.
+
+## Dataset Setup
+
+### SemanticKITTI
+
+Many of the training scripts assume a repository-local dataset directory named `dataset/` with a SemanticKITTI-like structure.
+
+Typical expectation:
+
+```text
+dataset/
+  sequences/
+    00/
+    01/
+    ...
+    21/
+```
+
+If your dataset lives elsewhere, either:
+
+- create a symlink named `dataset` pointing to the real location, or
+- edit the relevant training script arguments and hard-coded dataset roots
+
+Some scripts directly construct datasets with `root="dataset"`, so keeping that path available is the simplest setup.
+
+### Optional offline cache generation
+
+If you want to precompute projected range-view tensors for faster training, use:
+
+```bash
+python precompute_semantickitti.py \
+  --data-root /path/to/SemanticKITTI/sequences \
+  --sequences 00 01 02 03 04 05 06 07 09 10 \
+  --out-root /path/to/semk_cache \
+  --n-workers 8 \
+  --batch-size 4
+```
+
+To validate a generated cache:
+
+```bash
+python verify_semk_cache.py /path/to/semk_cache/seq_00
+```
+
+### nuScenes conversion
+
+For nuScenes-based experiments, the repository includes a conversion helper that exports a SemanticKITTI-like layout:
+
+```bash
+python utils/nuscenes2kitti.py \
+  --nuscenes_dir /path/to/nuscenes \
+  --output_dir /path/to/nuScenes_converted
+```
+
+Additional packages may be required for nuScenes workflows, for example:
+
+```bash
+pip install nuscenes-devkit pyquaternion click pillow
+```
+
+### Cityscapes and other experiments
+
+The repository also contains Cityscapes and other experiment-specific scripts. Those are not fully normalized behind a single CLI, so inspect the script you intend to run before launching training.
+
+## Optional Dependencies
+
+Some parts of the repository need extra packages beyond the base install.
+
+### DeepSpeed training
+
+If you plan to use `train_dpp_deepspeed.py` or the DeepSpeed config, install DeepSpeed separately:
+
+```bash
+pip install deepspeed
+```
+
+### Notebook and interactive tooling
+
+If you want to use the included notebooks or additional demo tooling from the SAM 2 codebase:
+
+```bash
+pip install -e ".[notebooks,interactive-demo]"
+```
+
+## Docker Installation
+
+The repository includes a Dockerfile based on NVIDIA CUDA 12.6.1.
+
+Build the image:
+
+```bash
+docker build -t rangesam:latest .
+```
+
+Run it with GPU access and mount your dataset:
+
+```bash
+docker run --rm -it \
+  --gpus all \
+  -v /path/to/your/dataset:/workspace/dataset \
+  -v $(pwd):/workspace \
+  rangesam:latest
+```
+
+The Docker image installs the repository and common dependencies, and is the most reproducible option if your local CUDA toolchain is inconsistent.
+
+## First Things To Check If Installation Fails
+
+### `pip install -e .` fails while building the SAM 2 extension
+
+Use:
+
+```bash
+SAM2_BUILD_CUDA=0 pip install -e .
+```
+
+The extension is optional for most workflows in this repository.
+
+### PyTorch wheel mismatch
+
+Make sure your PyTorch install matches your driver and desired CUDA runtime. If in doubt, reinstall PyTorch first and then rerun:
+
+```bash
+pip install -r requirements.txt
+SAM2_BUILD_CUDA=0 pip install -e .
+```
+
+### Missing dataset path errors
+
+Several scripts assume fixed paths such as `dataset/` and `checkpoints/`. Before debugging model code, verify that those directories exist and contain the expected files.
+
+## Project Layout
+
+Important paths:
+
+- `sam2/`: vendored SAM 2 implementation and configs
+- `preprocess/`: dataset parsing and preprocessing utilities
+- `config/`: dataset, architecture, and label mappings
+- `train.py`, `train_dpp.py`, `train_dpp_*`: training entrypoints and experiment variants
+- `test.py`, `eval.py`: evaluation and inference utilities
+- `download_ckpts.sh`: checkpoint downloader
+- `precompute_semantickitti.py`: offline cache generation
+- `verify_semk_cache.py`: cache verification utility
+
+## Citation
+
+If you use this repository, please cite the corresponding workshop paper:
+
+```bibtex
+@inproceedings{kuhn2026rangesam,
+  title={RangeSAM: On the Potential of Visual Foundation Models for Range-View Segmentation},
+  booktitle={Proceedings of the WACV 2026 Foundational Models Beyond the Visual Spectrum (FoMoV) Workshop},
+  year={2026},
+  url={https://openaccess.thecvf.com/content/WACV2026W/FoMoV/html/Kuhn_RangeSAM_On_the_Potential_of_Visual_Foundation_Models_for_Range-View_WACVW_2026_paper.html}
+}
+```
+
+If you need the exact published BibTeX from CVF, use the citation block on the paper page linked above.
+
+## Acknowledgements
+
+This repository builds on top of SAM 2 and related LiDAR segmentation tooling.
+
+- SAM 2: https://github.com/facebookresearch/sam2
+- WACV 2026 FoMoV Workshop paper page: https://openaccess.thecvf.com/content/WACV2026W/FoMoV/html/Kuhn_RangeSAM_On_the_Potential_of_Visual_Foundation_Models_for_Range-View_WACVW_2026_paper.html
 ```shell
 git clone https://github.com/WZH0120/SAM2-UNet.git
 cd SAM2-UNet/
@@ -72,11 +354,13 @@ If you are interested in designing SAM2-based methods, the following papers may 
 ## Citation and Star
 Please cite the following paper and star this project if you use this repository in your research. Thank you!
 ```
-@article{xiong2024sam2,
-  title={SAM2-UNet: Segment Anything 2 Makes Strong Encoder for Natural and Medical Image Segmentation},
-  author={Xiong, Xinyu and Wu, Zihuang and Tan, Shuangyi and Li, Wenxue and Tang, Feilong and Chen, Ying and Li, Siying and Ma, Jie and Li, Guanbin},
-  journal={arXiv preprint arXiv:2408.08870},
-  year={2024}
+@InProceedings{Kuhn_2026_WACV,
+    author    = {K\"uhn, Paul Julius and Nguyen, Duc Anh and Kuijper, Arjan and Sinha, Saptarshi Neil},
+    title     = {RangeSAM: On the Potential of Visual Foundation Models for Range-View represented LiDAR segmentation},
+    booktitle = {Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision (WACV) Workshops},
+    month     = {March},
+    year      = {2026},
+    pages     = {1540-1548}
 }
 ```
 
